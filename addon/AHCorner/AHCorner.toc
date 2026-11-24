@@ -1,0 +1,8 @@
+## Interface: 16001
+## Title: AH Corner
+## Notes: Read-only market plan and manual trade journal
+## Author: AH Corner
+## Version: 0.1.0
+## SavedVariables: AHCornerJournal
+Plan.lua
+AHCorner.lua
