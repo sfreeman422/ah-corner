@@ -118,7 +118,7 @@ docker compose up -d --force-recreate app
 for _ in {1..20}; do
   if curl -fsS -H 'Host: ah.muzzle.lol' http://127.0.0.1:3003/readyz; then
     echo
-    echo "AH Corner is ready at https://ah.muzzle.lol (HTTP Basic Auth required)."
+    echo "AH Corner is ready at https://ah.muzzle.lol."
     exit 0
   fi
   sleep 1

@@ -72,12 +72,10 @@ If migration fails, its message distinguishes an invalid URL, missing privileges
 
 ## Nginx and HTTPS
 
-The tracked [`deploy/nginx/ah.muzzle.lol.conf`](../deploy/nginx/ah.muzzle.lol.conf) proxies both the frontend and `/api/*` to the one AH Corner container at `127.0.0.1:3003`; do not modify the existing `muzzle.lol` or `api.muzzle.lol` vhosts. It requires HTTP Basic Auth because the application has no login of its own. From the server's interactive SSH terminal, enable it without replacing any existing site:
+The tracked [`deploy/nginx/ah.muzzle.lol.conf`](../deploy/nginx/ah.muzzle.lol.conf) proxies both the frontend and `/api/*` to the one AH Corner container at `127.0.0.1:3003`; do not modify the existing `muzzle.lol` or `api.muzzle.lol` vhosts. The AH Corner vhost is public and the app has no login: anyone who can reach it can view and modify its data. For a new installation, enable the vhost from the server's interactive SSH terminal:
 
 ```bash
 cd /home/muzzle.lol/ah-corner
-command -v htpasswd >/dev/null || sudo apt-get install -y apache2-utils
-sudo htpasswd -c /etc/nginx/.htpasswd-ah-corner <admin-user>
 sudo cp deploy/nginx/ah.muzzle.lol.conf /etc/nginx/sites-available/ah.muzzle.lol
 sudo ln -s /etc/nginx/sites-available/ah.muzzle.lol /etc/nginx/sites-enabled/ah.muzzle.lol
 sudo nginx -t
@@ -85,12 +83,10 @@ sudo systemctl reload nginx
 sudo certbot --nginx --redirect -d ah.muzzle.lol
 ```
 
-The first `htpasswd` invocation prompts for the dashboard password instead of placing it in shell history. The configuration deliberately leaves `/.well-known/acme-challenge/` unauthenticated so Certbot can issue the certificate. Its relevant proxy block is:
+The relevant proxy block is:
 
 ```nginx
 location / {
-    auth_basic "AH Corner";
-    auth_basic_user_file /etc/nginx/.htpasswd-ah-corner;
     proxy_set_header Host $host;
     proxy_set_header X-Real-IP $remote_addr;
     proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
@@ -99,7 +95,7 @@ location / {
 }
 ```
 
-After Certbot succeeds, verify both the loopback readiness endpoint and the authenticated HTTPS site. If the Nginx site is already enabled, use `sudo nginx -t && sudo systemctl reload nginx` after any configuration change instead of creating a second symlink.
+After Certbot succeeds, verify both the loopback readiness endpoint and the HTTPS site. If the Nginx site is already enabled, use `sudo nginx -t && sudo systemctl reload nginx` after any configuration change instead of creating a second symlink. Do not overwrite Certbot's installed HTTPS configuration with the initial HTTP-only template.
 
 ## Updating
 
