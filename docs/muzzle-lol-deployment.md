@@ -5,21 +5,28 @@ This deploys one AH Corner Docker container. MySQL remains the existing bare-met
 ## Host layout
 
 - AH Corner binds to `127.0.0.1:3003`; port 3000 remains reserved for Muzzle.
-- The host MySQL service listens on Docker's bridge gateway (`172.17.0.1:3306`). Compose maps that address to `host.docker.internal` inside the AH Corner container.
-- `ah.muzzle.lol` already resolves to the host, but needs its own Nginx virtual host and certificate.
+- The host MySQL service listens on Docker's bridge gateway (`172.17.0.1:3306`). Compose maps that address to `host.docker.internal` inside the AH Corner container. MySQL sees the container's source address from AH Corner's separate Compose network, not `172.17.0.0/16`; the bootstrap script determines that source range automatically.
+- `ah.muzzle.lol` resolves to the host and requires its own Nginx virtual host and certificate; both are installed on the current target host.
 
 ## MySQL setup
 
-Use the existing MySQL server, preferably with a dedicated `ahcorner` schema and two application-specific users. This remains one shared MySQL service while avoiding collisions and broad access to the Muzzle schema. Run the following in an interactive, privileged MySQL session. Replace the two password placeholders with distinct randomly generated hexadecimal passwords; do not put them in this document or commit them.
+Use the existing MySQL server with a dedicated `ahcorner` schema and two application-specific users. This remains one shared MySQL service while avoiding collisions and broad access to the Muzzle schema. The quickest safe setup is the tracked bootstrap script: it prompts for sudo, generates passwords without displaying them, writes the generated credentials only to the protected `.env`, migrates, and starts the container.
+
+```bash
+cd /home/muzzle.lol/ah-corner
+bash scripts/bootstrap-muzzle-mysql.sh
+```
+
+The script derives the exact Docker-network source range for the MySQL account grants. For a manual setup, first run `docker compose build app && docker compose create app`, then derive the range with `docker network inspect ah-corner_default --format '{{(index .IPAM.Config 0).Subnet}}'`. On the current host that range is `172.19.0.0/16`, so use `172.19.%` below. Replace the two password placeholders with distinct randomly generated hexadecimal passwords; do not put them in this document or commit them.
 
 ```sql
 CREATE DATABASE IF NOT EXISTS ahcorner CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
 
-CREATE USER IF NOT EXISTS 'ahcorner_runtime'@'172.17.%' IDENTIFIED BY '<runtime-password>';
-CREATE USER IF NOT EXISTS 'ahcorner_migrate'@'172.17.%' IDENTIFIED BY '<migration-password>';
+CREATE USER IF NOT EXISTS 'ah_corner_runtime'@'172.19.%' IDENTIFIED BY '<runtime-password>';
+CREATE USER IF NOT EXISTS 'ah_corner_migrate'@'172.19.%' IDENTIFIED BY '<migration-password>';
 
-GRANT SELECT, INSERT, UPDATE, DELETE ON ahcorner.* TO 'ahcorner_runtime'@'172.17.%';
-GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER, INDEX ON ahcorner.* TO 'ahcorner_migrate'@'172.17.%';
+GRANT SELECT, INSERT, UPDATE, DELETE ON ahcorner.* TO 'ah_corner_runtime'@'172.19.%';
+GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER, INDEX ON ahcorner.* TO 'ah_corner_migrate'@'172.19.%';
 FLUSH PRIVILEGES;
 ```
 
@@ -37,8 +44,8 @@ chmod 600 .env
 Set these values in `/home/muzzle.lol/ah-corner/.env`; leave the other application settings as appropriate. The passwords below are placeholders, not literal values.
 
 ```dotenv
-DATABASE_URL=mysql://ahcorner_runtime:<runtime-password>@host.docker.internal:3306/ahcorner
-DATABASE_MIGRATION_URL=mysql://ahcorner_migrate:<migration-password>@host.docker.internal:3306/ahcorner
+DATABASE_URL=mysql://ah_corner_runtime:<runtime-password>@host.docker.internal:3306/ahcorner
+DATABASE_MIGRATION_URL=mysql://ah_corner_migrate:<migration-password>@host.docker.internal:3306/ahcorner
 DATABASE_SSL=disable
 REQUIRE_DATABASE_SSL=false
 BIND_ADDRESS=127.0.0.1
