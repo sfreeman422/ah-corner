@@ -386,7 +386,7 @@ const server=createServer(async(request,response)=>{
   if(!file.startsWith(`${dist}/`))fail(404,'NOT_FOUND','That page does not exist.');
   try{
    const data=await readFile(file);
-   response.writeHead(200,{'Content-Type':mime[extname(file)]||'application/octet-stream','X-Content-Type-Options':'nosniff','Referrer-Policy':'no-referrer','X-Frame-Options':'DENY'});
+   response.writeHead(200,{'Content-Type':mime[extname(file)]||'application/octet-stream','Cache-Control':'no-store','X-Content-Type-Options':'nosniff','Referrer-Policy':'no-referrer','X-Frame-Options':'DENY'});
    response.end(data);
   }catch{
    sendProblem(response,new RequestProblem(503,{code:'FRONTEND_NOT_BUILT',message:'The AH Corner frontend has not been built.',action:'Run npm run build before starting the production server.'}));
