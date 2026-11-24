@@ -33,6 +33,7 @@ async function api<T>(path:string,body?:unknown):Promise<T>{
  }
  if(!response.ok){
   const error=isProblem((payload as {error?:unknown})?.error)?(payload as {error:PublicProblem}).error:undefined;
+  if(response.status===401&&error?.code==='SIGN_IN_REQUIRED')window.dispatchEvent(new Event('ah-session-expired'));
   throw new ApiFailure(error||{code:`HTTP_${response.status}`,message:'AH Corner could not complete that request.',action:'Try again. If this continues, check the server logs.'});
  }
  return payload as T;
@@ -47,7 +48,7 @@ type Status={mode:string;market:string;at:number|null;listingCount:number;snapsh
 type Position={itemId:number;quantity:number;basis:number;realized:number;unmatched:number};
 type Backtest={at:number;itemId:number;target:number;cost:number;potentialProfit:number;competingUnits:number;held:boolean};
 
-function App(){
+function App({onLogout}:{onLogout?:()=>void}){
  const [status,setStatus]=useState<Status>();
  const [rows,setRows]=useState<Opportunity[]>([]);
  const [bank,setBank]=useState(35);
@@ -116,7 +117,7 @@ function App(){
  return <>
   <header>
    <div className="brand"><span className="mark">◈</span><div><h1>AH Corner</h1><small>FOREVER MARKET INTELLIGENCE</small></div></div>
-   <div className="status"><span className={`dot ${status?.mode==='live'&&!status?.stale&&!status?.collector.lastError?'live':''}`}/>{sourceLabel}<small>{status?.market||'Connecting'}</small></div>
+   <div className="status"><span className={`dot ${status?.mode==='live'&&!status?.stale&&!status?.collector.lastError?'live':''}`}/>{sourceLabel}<small>{status?.market||'Connecting'}</small>{onLogout&&<button onClick={onLogout}>Sign out</button>}</div>
   </header>
   <main>
    <div className="intro">
@@ -184,4 +185,55 @@ function App(){
  </>;
 }
 
-createRoot(document.getElementById('root')!).render(<App/>);
+function AuthGate(){
+ const [state,setState]=useState<'loading'|'signed-out'|'signed-in'|'local'|'error'>('loading');
+ const [message,setMessage]=useState('');
+ useEffect(()=>{
+  let active=true;
+  const expired=()=>{setMessage('Your session has expired. Please sign in again.');setState('signed-out');};
+  window.addEventListener('ah-session-expired',expired);
+  void (async()=>{
+   try{
+    const params=new URLSearchParams(window.location.hash.slice(1));
+    const code=params.get('code');
+    const authError=new URLSearchParams(window.location.search).get('auth_error');
+    if(code||authError)window.history.replaceState({},'',window.location.pathname);
+    if(authError){if(active){setMessage('Slack sign-in did not complete. Please try again.');setState('signed-out');}return;}
+    if(code){
+     const verifier=sessionStorage.getItem('ah-login-verifier');
+     sessionStorage.removeItem('ah-login-verifier');
+     if(!verifier){if(active){setMessage('This sign-in started in another tab or has expired. Please start again.');setState('signed-out');}return;}
+     const response=await fetch('/auth/session',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({code,verifier})});
+     if(!response.ok){if(active){setMessage('Slack sign-in could not be completed. Please try again.');setState('signed-out');}return;}
+    }
+    const response=await fetch('/auth/session');
+    if(!response.ok)throw Error('Session unavailable');
+    const session=await response.json() as {required:boolean;authenticated:boolean};
+    if(active)setState(!session.required?'local':session.authenticated?'signed-in':'signed-out');
+   }catch{if(active){setMessage('AH Corner could not check your sign-in. Please refresh the page.');setState('error');}}
+  })();
+  return()=>{active=false;window.removeEventListener('ah-session-expired',expired);};
+ },[]);
+ async function logout(){
+  try{
+   const response=await fetch('/auth/session',{method:'DELETE',headers:{'Content-Type':'application/json'},body:'{}'});
+   if(!response.ok)throw Error('Logout failed');
+   setMessage('');setState('signed-out');
+  }catch{setMessage('Could not sign out. Please try again.');}
+ }
+ async function login(){
+  try{
+   const bytes=crypto.getRandomValues(new Uint8Array(32));
+   const encode=(value:Uint8Array)=>btoa(String.fromCharCode(...value)).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
+   const verifier=encode(bytes);
+   const challenge=encode(new Uint8Array(await crypto.subtle.digest('SHA-256',new TextEncoder().encode(verifier))));
+   sessionStorage.setItem('ah-login-verifier',verifier);
+   window.location.assign(`https://api.muzzle.lol/auth/slack?app=ah&challenge=${encodeURIComponent(challenge)}`);
+  }catch{setMessage('Could not start Slack sign-in. Please try again in a secure browser.');}
+ }
+ if(state==='loading')return <main><p>Checking sign-in…</p></main>;
+ if(state==='signed-in'||state==='local')return <><App onLogout={state==='signed-in'?()=>void logout():undefined}/>{message&&<div className="banner bad" role="alert">{message}</div>}</>;
+ return <main><section className="panel"><h1>AH Corner</h1><p>Sign in with your Muzzle Slack workspace to continue.</p>{message&&<p role="alert">{message}</p>}{state==='signed-out'&&<button onClick={()=>void login()}>Sign in with Slack</button>}</section></main>;
+}
+
+createRoot(document.getElementById('root')!).render(<AuthGate/>);

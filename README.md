@@ -33,7 +33,7 @@ docker compose logs -f app
 
 When MySQL/MariaDB is on the same Docker host, Compose maps `host.docker.internal` to Docker's host gateway, so the container can reach the bare-metal database without publishing MySQL in another container. Otherwise use the database server's DNS name or private IP and allow the Docker host through MySQL's bind address and user grants. The app exposes `/livez` and database-aware `/readyz`; Compose uses `/readyz` as its health check. A missing URL, an uninitialized schema, an invalid MySQL URL, or a database outage produces a specific startup/readiness error instead of silently falling back to local files.
 
-Use a TLS reverse proxy when exposing the app. The app has no login: without a separate access-control layer, anyone who can reach it can view and modify its data. Host/origin checks are not authentication. Use the MySQL/MariaDB server's backups and point-in-time recovery where available, and practice restores; the app intentionally retains only the newest 25 raw snapshots per market.
+Use a TLS reverse proxy when exposing the app. Set `REQUIRE_AUTH=true` to require Muzzle Slack sign-in; production mode refuses to start without it. This requires the Muzzle Slack exchange endpoint to be deployed. Sessions are held in memory and expire after at most 24 hours, so restarting the app signs users out. Local development can leave authentication disabled. Use the MySQL/MariaDB server's backups and point-in-time recovery where available, and practice restores; the app intentionally retains only the newest 25 raw snapshots per market.
 
 For the current `muzzle.lol` host layout, use the tailored [deployment guide](docs/muzzle-lol-deployment.md).
 

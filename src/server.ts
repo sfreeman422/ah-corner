@@ -9,6 +9,7 @@ import {backtest, historyFor, portfolio, scan, validInt} from './engine.ts';
 import {parseJournal, validateTrade} from './journal.ts';
 import {openStore} from './store.ts';
 import type {Alert, Opportunity, Settings} from './types.ts';
+import {Sessions} from './auth.ts';
 
 type PublicProblem={code:string;message:string;action?:string};
 
@@ -196,6 +197,9 @@ const allowedHosts=csv('APP_TRUSTED_HOSTS',[`localhost:${port}`,`127.0.0.1:${por
 allowedHosts.add(`localhost:${port}`);
 allowedHosts.add(`127.0.0.1:${port}`);
 const allowedOrigins=origins('APP_TRUSTED_ORIGINS',[`http://localhost:${port}`,`http://127.0.0.1:${port}`,'http://localhost:5173','http://127.0.0.1:5173']);
+const requireAuth=process.env.REQUIRE_AUTH==='true';
+if(process.env.NODE_ENV==='production'&&!requireAuth)throw Error('REQUIRE_AUTH=true is required in production');
+const sessions=new Sessions();
 const dist=resolve('dist');
 const mime:Record<string,string>={'.html':'text/html; charset=utf-8','.js':'text/javascript; charset=utf-8','.css':'text/css; charset=utf-8','.svg':'image/svg+xml','.json':'application/json'};
 
@@ -237,6 +241,7 @@ const server=createServer(async(request,response)=>{
   if(requestHost&&!allowedHosts.has(requestHost))fail(403,'HOST_REJECTED','This host is not approved for AH Corner.', 'Check APP_TRUSTED_HOSTS on the server.');
   if(method!=='GET'&&method!=='HEAD'){
    const origin=request.headers.origin?.toLowerCase();
+   if(requireAuth&&!origin)fail(403,'ORIGIN_REQUIRED','This request could not be verified.', 'Reload the page and try again.');
    if(origin&&!allowedOrigins.has(origin))fail(403,'ORIGIN_REJECTED','This browser origin is not approved for AH Corner.', 'Check APP_TRUSTED_ORIGINS on the server.');
    if(!request.headers['content-type']?.startsWith('application/json'))fail(415,'JSON_REQUIRED','AH Corner expected a JSON request.', 'Reload the page and try again.');
   }
@@ -252,6 +257,28 @@ const server=createServer(async(request,response)=>{
    json(response,{status:'ready'});
    return;
   }
+  if(path==='/auth/session'){
+   if(method==='GET'){
+    json(response,{required:requireAuth,authenticated:!requireAuth||sessions.valid(request.headers.cookie)});
+    return;
+   }
+   if(method==='POST'){
+    if(!requireAuth)fail(400,'AUTH_DISABLED','Sign-in is not enabled on this server.');
+    const input=await body(request);
+    let session:{cookie:string}|null;
+    try{session=await sessions.exchange(input.code,input.verifier);}
+    catch{fail(503,'AUTH_UNAVAILABLE','Slack sign-in is temporarily unavailable.','Try signing in again shortly.');}
+    if(!session)fail(401,'AUTH_EXPIRED','Your sign-in link expired or was already used.','Sign in with Slack again.');
+    json(response,{authenticated:true},200,{'Set-Cookie':session.cookie});
+    return;
+   }
+   if(method==='DELETE'){
+    json(response,{authenticated:false},200,{'Set-Cookie':sessions.logout(request.headers.cookie)});
+    return;
+   }
+   fail(405,'METHOD_NOT_ALLOWED','That action is not available with this request method.');
+  }
+  if(path.startsWith('/api/')&&requireAuth&&!sessions.valid(request.headers.cookie))fail(401,'SIGN_IN_REQUIRED','Please sign in with Slack.','Your session may have expired.');
   if(path==='/api/status'){
    requireMethod(method,'GET');
    const snapshot=latest();

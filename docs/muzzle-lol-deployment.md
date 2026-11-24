@@ -50,6 +50,7 @@ DATABASE_URL=mysql://ah_corner_runtime:<runtime-password>@host.docker.internal:3
 DATABASE_MIGRATION_URL=mysql://ah_corner_migrate:<migration-password>@host.docker.internal:3306/ahcorner
 DATABASE_SSL=disable
 REQUIRE_DATABASE_SSL=false
+REQUIRE_AUTH=true
 BIND_ADDRESS=127.0.0.1
 HOST_PORT=3003
 APP_TRUSTED_HOSTS=ah.muzzle.lol
@@ -72,7 +73,7 @@ If migration fails, its message distinguishes an invalid URL, missing privileges
 
 ## Nginx and HTTPS
 
-The tracked [`deploy/nginx/ah.muzzle.lol.conf`](../deploy/nginx/ah.muzzle.lol.conf) proxies both the frontend and `/api/*` to the one AH Corner container at `127.0.0.1:3003`; do not modify the existing `muzzle.lol` or `api.muzzle.lol` vhosts. The AH Corner vhost is public and the app has no login: anyone who can reach it can view and modify its data. For a new installation, enable the vhost from the server's interactive SSH terminal:
+The tracked [`deploy/nginx/ah.muzzle.lol.conf`](../deploy/nginx/ah.muzzle.lol.conf) proxies both the frontend and `/api/*` to the one AH Corner container at `127.0.0.1:3003`; do not modify the existing `muzzle.lol` or `api.muzzle.lol` vhosts. Deploy the Muzzle Slack exchange endpoint before starting AH Corner with `REQUIRE_AUTH=true`. For a new installation, enable the vhost from the server's interactive SSH terminal:
 
 ```bash
 cd /home/muzzle.lol/ah-corner

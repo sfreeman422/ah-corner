@@ -94,7 +94,7 @@ cleanup(){ rm -f "$temp_env"; }
 trap cleanup EXIT
 chmod 600 "$temp_env"
 awk '
-  /^DATABASE_URL=/ || /^DATABASE_MIGRATION_URL=/ || /^DATABASE_SSL=/ || /^REQUIRE_DATABASE_SSL=/ ||
+  /^DATABASE_URL=/ || /^DATABASE_MIGRATION_URL=/ || /^DATABASE_SSL=/ || /^REQUIRE_DATABASE_SSL=/ || /^REQUIRE_AUTH=/ ||
   /^BIND_ADDRESS=/ || /^HOST_PORT=/ || /^APP_TRUSTED_HOSTS=/ || /^APP_TRUSTED_ORIGINS=/ { next }
   { print }
 ' .env > "$temp_env"
@@ -103,6 +103,7 @@ printf '%s\n' \
   "DATABASE_MIGRATION_URL=$migration_url" \
   'DATABASE_SSL=disable' \
   'REQUIRE_DATABASE_SSL=false' \
+  'REQUIRE_AUTH=true' \
   'BIND_ADDRESS=127.0.0.1' \
   'HOST_PORT=3003' \
   'APP_TRUSTED_HOSTS=ah.muzzle.lol' \
