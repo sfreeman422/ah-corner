@@ -63,7 +63,20 @@ If migration fails, its message distinguishes an invalid URL, missing privileges
 
 ## Nginx and HTTPS
 
-Create an Nginx vhost for only `ah.muzzle.lol`, proxying to `127.0.0.1:3003`; do not modify the existing `muzzle.lol` or `api.muzzle.lol` vhosts. Require authentication before public exposure. A minimal authenticated proxy location is:
+The tracked [`deploy/nginx/ah.muzzle.lol.conf`](../deploy/nginx/ah.muzzle.lol.conf) proxies both the frontend and `/api/*` to the one AH Corner container at `127.0.0.1:3003`; do not modify the existing `muzzle.lol` or `api.muzzle.lol` vhosts. It requires HTTP Basic Auth because the application has no login of its own. From the server's interactive SSH terminal, enable it without replacing any existing site:
+
+```bash
+cd /home/muzzle.lol/ah-corner
+command -v htpasswd >/dev/null || sudo apt-get install -y apache2-utils
+sudo htpasswd -c /etc/nginx/.htpasswd-ah-corner <admin-user>
+sudo cp deploy/nginx/ah.muzzle.lol.conf /etc/nginx/sites-available/ah.muzzle.lol
+sudo ln -s /etc/nginx/sites-available/ah.muzzle.lol /etc/nginx/sites-enabled/ah.muzzle.lol
+sudo nginx -t
+sudo systemctl reload nginx
+sudo certbot --nginx --redirect -d ah.muzzle.lol
+```
+
+The first `htpasswd` invocation prompts for the dashboard password instead of placing it in shell history. The configuration deliberately leaves `/.well-known/acme-challenge/` unauthenticated so Certbot can issue the certificate. Its relevant proxy block is:
 
 ```nginx
 location / {
@@ -77,7 +90,7 @@ location / {
 }
 ```
 
-After testing the configuration with `sudo nginx -t`, reload it and issue a dedicated certificate with `sudo certbot --nginx -d ah.muzzle.lol`. Create the htpasswd file with `sudo htpasswd -c /etc/nginx/.htpasswd-ah-corner <admin-user>` (install `apache2-utils` first if `htpasswd` is absent). Then verify both the loopback readiness endpoint and the authenticated HTTPS site.
+After Certbot succeeds, verify both the loopback readiness endpoint and the authenticated HTTPS site. If the Nginx site is already enabled, use `sudo nginx -t && sudo systemctl reload nginx` after any configuration change instead of creating a second symlink.
 
 ## Updating
 
