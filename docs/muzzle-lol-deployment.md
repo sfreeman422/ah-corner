@@ -32,7 +32,7 @@ GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER, INDEX ON ahcorner.* TO 'ah_
 FLUSH PRIVILEGES;
 ```
 
-If the existing Muzzle schema must be used instead, AH Corner uses only `ah_corner_state`, `ah_corner_snapshots`, and `ah_corner_schema_migrations`. Reserve those names and give the runtime user table-level `SELECT`, `INSERT`, `UPDATE`, and `DELETE` after the first migration. A dedicated schema is safer because future migrations will need controlled schema privileges.
+If the existing Muzzle schema must be used instead, AH Corner uses `ah_corner_state`, `ah_corner_snapshots`, `ah_corner_price_history`, and `ah_corner_schema_migrations`. Reserve those names and give the runtime user table-level `SELECT`, `INSERT`, `UPDATE`, and `DELETE` on the application tables and `SELECT` on the migration table after migrations. A dedicated schema is safer because future migrations will need controlled schema privileges.
 
 ## Application deployment
 
@@ -51,6 +51,7 @@ DATABASE_MIGRATION_URL=mysql://ah_corner_migrate:<migration-password>@host.docke
 DATABASE_SSL=disable
 REQUIRE_DATABASE_SSL=false
 REQUIRE_AUTH=true
+COLLECT_SCHEDULE=cron
 BIND_ADDRESS=127.0.0.1
 HOST_PORT=3003
 APP_TRUSTED_HOSTS=ah.muzzle.lol
@@ -70,6 +71,16 @@ curl -fsS -H 'Host: ah.muzzle.lol' http://127.0.0.1:3003/readyz
 ```
 
 If migration fails, its message distinguishes an invalid URL, missing privileges, an unavailable MySQL service, and migration-lock contention. Do not start the public proxy until `/readyz` succeeds.
+
+## Hourly collection
+
+After configuring the Blizzard API client and manually verifying the auction house as described in the main README, set `MODE=live`, `HOUSE_ID`, and `HOUSE_VERIFIED=true` in `.env` and recreate the app. Keep `COLLECT_SCHEDULE=cron` when using the host's hourly job. The job invokes the running app rather than starting a second collector. A crontab entry for this host is:
+
+```cron
+0 * * * * /bin/bash /home/muzzle.lol/ah-corner/scripts/collect-hourly.sh >> /home/muzzle.lol/logs/ah-corner-collector.log 2>&1
+```
+
+The script exits nonzero on errors and does not expose credentials. Live mode also makes a collection when the app starts. Cron must be running, and the app container must be up when the job runs. Review the log and dashboard collector status; a successful poll records one compact observation per item per hour, not necessarily a new Blizzard publication. Live API-derived data is pruned after 30 days; manage backups accordingly.
 
 ## Nginx and HTTPS
 

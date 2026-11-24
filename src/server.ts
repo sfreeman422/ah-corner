@@ -5,7 +5,7 @@ import type {IncomingMessage, ServerResponse} from 'node:http';
 import {extname, resolve} from 'node:path';
 import {Blizzard} from './blizzard.ts';
 import {demoSnapshots, names} from './demo.ts';
-import {backtest, historyFor, portfolio, scan, validInt} from './engine.ts';
+import {backtest, portfolio, scan, validInt} from './engine.ts';
 import {parseJournal, validateTrade} from './journal.ts';
 import {openStore} from './store.ts';
 import type {Alert, Opportunity, Settings} from './types.ts';
@@ -78,6 +78,8 @@ function collectorProblem(error:unknown):PublicProblem{
 
 const mode=process.env.MODE||'demo';
 if(!['demo','live'].includes(mode))throw Error('MODE must be demo or live');
+const collectSchedule=process.env.COLLECT_SCHEDULE||'interval';
+if(!['interval','cron'].includes(collectSchedule))throw Error('COLLECT_SCHEDULE must be interval or cron');
 const demo=mode==='demo';
 const house=Number(process.env.HOUSE_ID);
 const blizzard=new Blizzard();
@@ -99,7 +101,23 @@ function validSettings(value:Settings){
 
 validSettings(settings);
 const store=await openStore(market);
+await store.prune();
 let state=await store.load();
+const liveDataRetentionMs=30*24*60*60*1_000;
+function expireLiveState(){
+ if(demo)return false;
+ const now=Date.now();
+ let changed=false;
+ if(Object.keys(state.names).length&&!(typeof state.namesFetchedAt==='number'&&Number.isFinite(state.namesFetchedAt)&&state.namesFetchedAt<=now&&now-state.namesFetchedAt<liveDataRetentionMs)){
+  state.names={};
+  delete state.namesFetchedAt;
+  changed=true;
+ }
+ const alerts=state.alerts.filter(alert=>Number.isFinite(alert.at)&&alert.at<=now&&now-alert.at<liveDataRetentionMs);
+ if(alerts.length!==state.alerts.length){state.alerts=alerts;changed=true;}
+ return changed;
+}
+if(expireLiveState())await store.save(state);
 let snapshots=await store.snapshots();
 let busy=false;
 let lastChecked=0;
@@ -119,6 +137,12 @@ function latest(){return snapshots.at(-1);}
 function refresh(){
  const snapshot=latest();
  cached=snapshot?scan(snapshot,snapshots,settings):[];
+}
+
+function expireInMemorySnapshots(){
+ const cutoff=Date.now()-liveDataRetentionMs;
+ const retained=snapshots.filter(snapshot=>snapshot.source!=='blizzard'||(Number.isFinite(snapshot.at)&&snapshot.at>cutoff));
+ if(retained.length!==snapshots.length){snapshots=retained;refresh();}
 }
 
 async function alerts(){
@@ -146,6 +170,9 @@ async function collect(){
  busy=true;
  lastChecked=Date.now();
  try{
+  expireInMemorySnapshots();
+  await store.prune();
+  if(expireLiveState())await save();
   if(demo){
    if(!snapshots.length||Date.now()-(latest()?.at||0)>=3_600_000){
     for(const snapshot of demoSnapshots())await store.put(snapshot);
@@ -154,7 +181,11 @@ async function collect(){
    Object.assign(state.names,names);
   }else{
    const result=await blizzard.snapshot(house,state.modified);
-   if(result.snapshot&&await store.put(result.snapshot)){
+   if(result.snapshot){
+    await store.put(result.snapshot);
+    // A complete unchanged book is a fresh observation too; replace the
+    // in-memory copy so freshness checks do not expire unchanged prices.
+    snapshots=snapshots.filter(snapshot=>snapshot.key!==result.snapshot!.key);
     snapshots.push(result.snapshot);
     snapshots.sort((a,b)=>a.at-b.at);
     snapshots=snapshots.slice(-25);
@@ -165,7 +196,11 @@ async function collect(){
   if(!demo){
    const ids=[...new Set([...cached.slice(0,30).map(value=>value.itemId),...state.watch])].filter(id=>!state.names[id]).slice(0,30);
    for(const id of ids){
-    try{state.names[id]=await blizzard.name(id);}
+    try{
+     const name=await blizzard.name(id);
+     state.namesFetchedAt??=Date.now();
+     state.names[id]=name;
+    }
     catch{break;}
    }
   }
@@ -189,8 +224,8 @@ else{
  void collect();
 }
 
-const pollMinutes=Math.max(5,positiveInteger('POLL_MINUTES',15));
-const interval=setInterval(()=>void collect(),pollMinutes*60_000);
+const pollMinutes=Math.max(5,positiveInteger('POLL_MINUTES',60));
+const interval=collectSchedule==='interval'?setInterval(()=>void collect(),pollMinutes*60_000):undefined;
 const port=positiveInteger('PORT',3000);
 const host=process.env.HOST||'127.0.0.1';
 const allowedHosts=csv('APP_TRUSTED_HOSTS',[`localhost:${port}`,`127.0.0.1:${port}`,'localhost:5173','127.0.0.1:5173']);
@@ -239,6 +274,21 @@ const server=createServer(async(request,response)=>{
   const method=request.method||'GET';
   const requestHost=request.headers.host?.toLowerCase();
   if(requestHost&&!allowedHosts.has(requestHost))fail(403,'HOST_REJECTED','This host is not approved for AH Corner.', 'Check APP_TRUSTED_HOSTS on the server.');
+  if(path==='/internal/collect'){
+   const address=request.socket.remoteAddress;
+   const loopback=address==='127.0.0.1'||address==='::ffff:127.0.0.1'||address==='::1';
+   const localHost=requestHost===`127.0.0.1:${port}`||requestHost===`localhost:${port}`||requestHost===`[::1]:${port}`;
+   const proxied=Object.keys(request.headers).some(name=>name==='forwarded'||name==='via'||name==='x-real-ip'||name.startsWith('x-forwarded-'));
+   if(!loopback||!localHost||request.headers.origin!==undefined||proxied)fail(404,'NOT_FOUND','That AH Corner route does not exist.');
+   requireMethod(method,'POST');
+   if(collectSchedule!=='cron')fail(409,'CRON_NOT_ENABLED','Cron collection is not enabled.','Set COLLECT_SCHEDULE=cron before using the hourly job.');
+   if(!request.headers['content-type']?.startsWith('application/json'))fail(415,'JSON_REQUIRED','AH Corner expected a JSON request.');
+   await body(request);
+   if(busy)fail(409,'COLLECTION_IN_PROGRESS','A market refresh is already in progress.','The next hourly job will retry.');
+   if(!await collect())throw new RequestProblem(503,lastCollectionError||{code:'COLLECTION_FAILED',message:'The market refresh failed.',action:'Check the server logs.'});
+   json(response,{status:'completed',lastChecked,lastSuccess});
+   return;
+  }
   if(method!=='GET'&&method!=='HEAD'){
    const origin=request.headers.origin?.toLowerCase();
    if(requireAuth&&!origin)fail(403,'ORIGIN_REQUIRED','This request could not be verified.', 'Reload the page and try again.');
@@ -279,10 +329,12 @@ const server=createServer(async(request,response)=>{
    fail(405,'METHOD_NOT_ALLOWED','That action is not available with this request method.');
   }
   if(path.startsWith('/api/')&&requireAuth&&!sessions.valid(request.headers.cookie))fail(401,'SIGN_IN_REQUIRED','Please sign in with Slack.','Your session may have expired.');
+  if(path.startsWith('/api/'))expireInMemorySnapshots();
   if(path==='/api/status'){
    requireMethod(method,'GET');
+   if(expireLiveState())await save();
    const snapshot=latest();
-   json(response,{mode,market,at:snapshot?.at||null,listingCount:snapshot?.listings.length||0,snapshots:snapshots.length,collector:{busy,lastChecked,lastSuccess,lastError:lastCollectionError||null,nextScheduledAt:lastChecked?lastChecked+pollMinutes*60_000:null},settings,watch:state.watch,names:state.names,stale:!snapshot||Date.now()-snapshot.at>7_200_000});
+   json(response,{mode,market,at:snapshot?.at||null,listingCount:snapshot?.listings.length||0,snapshots:snapshots.length,collector:{busy,lastChecked,lastSuccess,lastError:lastCollectionError||null,nextScheduledAt:collectSchedule==='interval'&&lastChecked?lastChecked+pollMinutes*60_000:null},settings,watch:state.watch,names:state.names,stale:!snapshot||Date.now()-snapshot.at>7_200_000});
    return;
   }
   if(path==='/api/opportunities'){
@@ -301,7 +353,7 @@ const server=createServer(async(request,response)=>{
    requireMethod(method,'GET');
    const id=Number(url.searchParams.get('id'));
    if(!validInt(id))fail(422,'INVALID_ITEM_ID','Choose a valid positive item ID.');
-   json(response,historyFor(snapshots,id));
+   json(response,await store.history(id));
    return;
   }
   if(path==='/api/backtest'){
@@ -311,6 +363,7 @@ const server=createServer(async(request,response)=>{
   }
   if(path==='/api/alerts'){
    requireMethod(method,'GET');
+   if(expireLiveState())await save();
    json(response,state.alerts);
    return;
   }

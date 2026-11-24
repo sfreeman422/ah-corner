@@ -1,14 +1,17 @@
 import {mkdir, readFile, readdir, rename, unlink, writeFile} from 'node:fs/promises';
 import {join} from 'node:path';
 import type {Pool, PoolConnection, PoolOptions, ResultSetHeader, RowDataPacket} from 'mysql2/promise';
-import type {Alert, Snapshot, Trade} from './types.ts';
+import {groups,stats} from './engine.ts';
+import type {Alert, Snapshot, Stats, Trade} from './types.ts';
 
-export type State={names:Record<number,string>;trades:Trade[];alerts:Alert[];watch:number[];modified?:string};
+export type State={names:Record<number,string>;namesFetchedAt?:number;trades:Trade[];alerts:Alert[];watch:number[];modified?:string};
 export type Store={
  load:()=>Promise<State>;
  save:(s:State)=>Promise<void>;
  snapshots:()=>Promise<Snapshot[]>;
  put:(s:Snapshot)=>Promise<boolean>;
+ history:(itemId:number)=>Promise<Stats[]>;
+ prune:()=>Promise<void>;
  health:()=>Promise<void>;
  close:()=>Promise<void>;
 };
@@ -17,12 +20,27 @@ type Database=Pool|PoolConnection;
 type Migration={version:string;file:URL};
 
 const empty=():State=>({names:{},trades:[],alerts:[],watch:[]});
-const migrations:Migration[]=[{version:'001',file:new URL('../migrations/001.sql',import.meta.url)}];
+const migrations:Migration[]=[{version:'001',file:new URL('../migrations/001.sql',import.meta.url)},{version:'002',file:new URL('../migrations/002.sql',import.meta.url)}];
 const latestMigration=migrations.at(-1)!.version;
 const migrationLock='ah-corner:migrations';
 const stateTable='ah_corner_state';
 const snapshotsTable='ah_corner_snapshots';
 const migrationsTable='ah_corner_schema_migrations';
+const historyTable='ah_corner_price_history';
+const retentionMs=30*24*60*60*1_000;
+const historyLimit=720;
+const batchSize=250;
+
+type HistorySnapshot={key:string;at:number;source:Snapshot['source'];items:Record<number,Stats>};
+
+function summary(snapshot:Snapshot):HistorySnapshot{
+ const items:Record<number,Stats>={};
+ for(const [itemId,rows] of groups(snapshot)){
+  const itemStats=stats(rows,snapshot.at);
+  if(itemStats)items[itemId]=itemStats;
+ }
+ return {key:snapshot.key,at:snapshot.at,source:snapshot.source,items};
+}
 
 function enabled(name:string){return process.env[name]==='true';}
 
@@ -121,6 +139,41 @@ async function trimSnapshots(pool:Pool,market:string){
  if(rows.length===1000)await trimSnapshots(pool,market);
 }
 
+// A snapshot and all its compact history rows are committed together. A failed
+// batch rolls back the raw book as well, allowing the collector to retry it.
+export async function saveSnapshotTransaction(pool:Pick<Pool,'getConnection'>,market:string,snapshot:Snapshot):Promise<boolean>{
+ if(snapshot.market!==market)throw Error('Snapshot market does not match store market');
+ const history=summary(snapshot);
+ const client=await pool.getConnection();
+ try{
+  await client.beginTransaction();
+  try{
+   let inserted=true;
+   try{
+    await execute<ResultSetHeader>(client,`INSERT INTO ${snapshotsTable}(market,snapshot_key,recorded_at,data) VALUES(?,?,?,?)`,[market,snapshot.key,snapshot.at,JSON.stringify(snapshot)]);
+   }catch(error){
+    if((error as {code?:string}).code!=='ER_DUP_ENTRY')throw error;
+    inserted=false;
+    await execute<ResultSetHeader>(client,`UPDATE ${snapshotsTable} SET recorded_at=?,data=? WHERE market=? AND snapshot_key=?`,[snapshot.at,JSON.stringify(snapshot),market,snapshot.key]);
+   }
+   const entries=Object.entries(history.items);
+   for(let offset=0;offset<entries.length;offset+=batchSize){
+    const batch=entries.slice(offset,offset+batchSize);
+    const values:any[]=[];
+    for(const [itemId,point] of batch)values.push(market,snapshot.key,Number(itemId),snapshot.source,Math.floor(snapshot.at/3_600_000),snapshot.at,point.floor,point.median,point.units,point.listings);
+    // Keep the latest successful observation of each item per hour, even when
+    // the raw book is identical to a previously retained snapshot.
+    await execute<ResultSetHeader>(client,`INSERT INTO ${historyTable}(market,snapshot_key,item_id,source,hour_bucket,recorded_at,floor_price,median_price,units,listing_count) VALUES ${batch.map(()=>'(?,?,?,?,?,?,?,?,?,?)').join(',')} ON DUPLICATE KEY UPDATE snapshot_key=IF(VALUES(recorded_at)>=recorded_at,VALUES(snapshot_key),snapshot_key),source=IF(VALUES(recorded_at)>=recorded_at,VALUES(source),source),floor_price=IF(VALUES(recorded_at)>=recorded_at,VALUES(floor_price),floor_price),median_price=IF(VALUES(recorded_at)>=recorded_at,VALUES(median_price),median_price),units=IF(VALUES(recorded_at)>=recorded_at,VALUES(units),units),listing_count=IF(VALUES(recorded_at)>=recorded_at,VALUES(listing_count),listing_count),recorded_at=GREATEST(recorded_at,VALUES(recorded_at))`,values);
+   }
+   await client.commit();
+   return inserted;
+  }catch(error){
+   await client.rollback();
+   throw error;
+  }
+ }finally{client.release();}
+}
+
 export async function runMigrations(){
  const connectionString=process.env.DATABASE_MIGRATION_URL||process.env.DATABASE_URL;
  if(!connectionString)throw Error('DATABASE_MIGRATION_URL or DATABASE_URL is required to run migrations');
@@ -179,9 +232,30 @@ export async function openStore(market:string):Promise<Store>{
     return rows.map(row=>parseJson<Snapshot>(row.data)).reverse();
    },
    async put(snapshot){
-    const result=await execute<ResultSetHeader>(pool,`INSERT IGNORE INTO ${snapshotsTable}(market,snapshot_key,recorded_at,data) VALUES(?,?,?,?)`,[market,snapshot.key,snapshot.at,JSON.stringify(snapshot)]);
-    await trimSnapshots(pool,market);
-    return result.affectedRows===1;
+    const inserted=await saveSnapshotTransaction(pool,market,snapshot);
+    if(inserted){
+     try{await trimSnapshots(pool,market);}
+     catch(error){console.warn('Could not trim old raw snapshots:',error);}
+    }
+    return inserted;
+   },
+   async history(itemId){
+    const rows=await execute<RowDataPacket[]>(pool,`SELECT recorded_at,floor_price,median_price,units,listing_count FROM ${historyTable} WHERE market=? AND item_id=? AND (source <> 'blizzard' OR recorded_at >= ?) ORDER BY recorded_at DESC,snapshot_key DESC LIMIT ${historyLimit}`,[market,itemId,Date.now()-retentionMs]);
+    return rows.map(row=>({at:Number(row.recorded_at),floor:Number(row.floor_price),median:Number(row.median_price),units:Number(row.units),listings:Number(row.listing_count)})).reverse();
+   },
+   async prune(){
+    const cutoff=Date.now()-retentionMs;
+    // These tables are private to AH Corner. Preserve synthetic demo data and
+    // other application tables while expiring Blizzard-derived records only.
+    let deleted:number;
+    do{
+     const result=await execute<ResultSetHeader>(pool,`DELETE FROM ${historyTable} WHERE source='blizzard' AND recorded_at < ? LIMIT 1000`,[cutoff]);
+     deleted=result.affectedRows;
+    }while(deleted===1000);
+    do{
+     const result=await execute<ResultSetHeader>(pool,`DELETE FROM ${snapshotsTable} WHERE recorded_at < ? AND JSON_UNQUOTE(JSON_EXTRACT(data,'$.source'))='blizzard' LIMIT 1000`,[cutoff]);
+     deleted=result.affectedRows;
+    }while(deleted===1000);
    },
    async health(){await execute<RowDataPacket[]>(pool,'SELECT 1 AS ready');},
    async close(){await pool.end();}
@@ -192,11 +266,55 @@ export async function openStore(market:string):Promise<Store>{
  await mkdir(dir,{recursive:true});
  const state=join(dir,'state.json');
  async function atomic(path:string,value:unknown){await writeFile(path+'.tmp',JSON.stringify(value),{mode:0o600});await rename(path+'.tmp',path);}
+ async function summaries(){
+  const files=(await readdir(dir)).filter(file=>file.startsWith('history-')&&file.endsWith('.json'));
+  return Promise.all(files.map(async file=>({file,entry:JSON.parse(await readFile(join(dir,file),'utf8')) as HistorySnapshot})));
+ }
  return {
   async load(){try{return JSON.parse(await readFile(state,'utf8'));}catch(error){if((error as NodeJS.ErrnoException).code==='ENOENT')return empty();throw error;}},
   async save(nextState){await atomic(state,nextState);},
   async snapshots(){const files=(await readdir(dir)).filter(file=>file.startsWith('snap-')&&file.endsWith('.json')).sort();return Promise.all(files.slice(-25).map(async file=>JSON.parse(await readFile(join(dir,file),'utf8'))));},
-  async put(snapshot){const key=snapshot.key.replace(/[^a-zA-Z0-9-]/g,'_');const files=(await readdir(dir)).filter(file=>file.startsWith('snap-')&&file.endsWith('.json'));if(files.some(file=>file.endsWith(`-${key}.json`)))return false;await atomic(join(dir,`snap-${snapshot.at}-${key}.json`),snapshot);const sorted=(await readdir(dir)).filter(file=>file.startsWith('snap-')&&file.endsWith('.json')).sort();for(const file of sorted.slice(0,Math.max(0,sorted.length-25)))await unlink(join(dir,file));return true;},
+  async put(snapshot){
+   if(snapshot.market!==market)throw Error('Snapshot market does not match store market');
+   const key=snapshot.key.replace(/[^a-zA-Z0-9-]/g,'_');
+   const files=(await readdir(dir)).filter(file=>file.startsWith('snap-')&&file.endsWith('.json'));
+   const oldFile=files.find(file=>file.endsWith(`-${key}.json`));
+   const duplicate=!!oldFile;
+   const historyPath=join(dir,`history-${Math.floor(snapshot.at/3_600_000)}.json`);
+   let previous:HistorySnapshot|undefined;
+   try{previous=JSON.parse(await readFile(historyPath,'utf8')) as HistorySnapshot;}
+   catch(error){if((error as NodeJS.ErrnoException).code!=='ENOENT')throw error;}
+   const next=summary(snapshot);
+   if(previous){
+    for(const [itemId,point] of Object.entries(previous.items))if(!next.items[Number(itemId)]||point.at>next.items[Number(itemId)].at)next.items[Number(itemId)]=point;
+    if(previous.at>next.at){next.at=previous.at;next.key=previous.key;next.source=previous.source;}
+   }
+   await atomic(historyPath,next);
+   try{await atomic(join(dir,`snap-${snapshot.at}-${key}.json`),snapshot);}
+   catch(error){if(previous)await atomic(historyPath,previous);else await unlink(historyPath).catch(()=>{});throw error;}
+   if(oldFile&&oldFile!==`snap-${snapshot.at}-${key}.json`)await unlink(join(dir,oldFile));
+   if(duplicate)return false;
+   const sorted=(await readdir(dir)).filter(file=>file.startsWith('snap-')&&file.endsWith('.json')).sort();
+   for(const file of sorted.slice(0,Math.max(0,sorted.length-25)))await unlink(join(dir,file));
+   return true;
+  },
+  async history(itemId){
+   const cutoff=Date.now()-retentionMs;
+   return (await summaries()).map(({entry})=>({source:entry.source,point:entry.items[itemId]})).filter(({source,point})=>!!point&&(source!=='blizzard'||point.at>=cutoff)).map(({point})=>point).sort((a,b)=>a.at-b.at).slice(-historyLimit);
+  },
+  async prune(){
+   const cutoff=Date.now()-retentionMs;
+   for(const {file,entry} of await summaries())if(entry.source==='blizzard'){
+    const items=Object.entries(entry.items).filter(([,point])=>point.at>=cutoff);
+    if(!items.length)await unlink(join(dir,file));
+    else if(items.length!==Object.keys(entry.items).length)await atomic(join(dir,file),{...entry,items:Object.fromEntries(items)});
+   }
+   const files=(await readdir(dir)).filter(file=>file.startsWith('snap-')&&file.endsWith('.json'));
+   for(const file of files){
+    const snapshot=JSON.parse(await readFile(join(dir,file),'utf8')) as Snapshot;
+    if(snapshot.source==='blizzard'&&snapshot.at<cutoff)await unlink(join(dir,file));
+   }
+  },
   async health(){},
   async close(){}
  };
