@@ -17,6 +17,8 @@ cd /home/muzzle.lol/ah-corner
 bash scripts/bootstrap-muzzle-mysql.sh
 ```
 
+Enter the MySQL root password at the MySQL prompt; it can differ from the sudo password. Do not run the script itself with `sudo` or paste either password into chat. For a MySQL installation that uses passwordless root socket authentication, run `AH_CORNER_MYSQL_AUTH=socket bash scripts/bootstrap-muzzle-mysql.sh` instead.
+
 The script derives the exact Docker-network source range for the MySQL account grants. For a manual setup, first run `docker compose build app && docker compose create app`, then derive the range with `docker network inspect ah-corner_default --format '{{(index .IPAM.Config 0).Subnet}}'`. On the current host that range is `172.19.0.0/16`, so use `172.19.%` below. Replace the two password placeholders with distinct randomly generated hexadecimal passwords; do not put them in this document or commit them.
 
 ```sql

@@ -7,6 +7,10 @@ if [[ $- == *x* ]]; then
   echo "Do not run this script with shell tracing enabled; it handles generated credentials." >&2
   exit 2
 fi
+if [[ $(id -u) -eq 0 ]]; then
+  echo "Run this script as your regular server user, without sudo; it will prompt for sudo when needed." >&2
+  exit 2
+fi
 
 project_dir="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 database_name="${AH_CORNER_DATABASE:-ahcorner}"
@@ -51,12 +55,25 @@ echo "This creates the isolated $database_name schema and AH Corner-only MySQL u
 echo "The MySQL users will accept connections only from Docker range $docker_host_pattern."
 sudo -v
 
+# This host's MySQL root account can require a password even when the OS user
+# has sudo. Prompt on the terminal; never pass the password in an argument.
+mysql_auth_args=(--user=root --password)
+if [[ "${AH_CORNER_MYSQL_AUTH:-password}" == "socket" ]]; then
+  mysql_auth_args=(--user=root)
+elif [[ "${AH_CORNER_MYSQL_AUTH:-password}" != "password" ]]; then
+  echo "AH_CORNER_MYSQL_AUTH must be password or socket." >&2
+  exit 2
+fi
+if [[ "${AH_CORNER_MYSQL_AUTH:-password}" == "password" ]]; then
+  echo "MySQL will prompt for its root password (which may differ from your sudo password)."
+fi
+
 runtime_password="$(openssl rand -hex 32)"
 migration_password="$(openssl rand -hex 32)"
 
 # Supply SQL on stdin rather than as command-line arguments, keeping generated
 # passwords out of process listings. Values are constrained/generated above.
-sudo mysql <<SQL
+sudo mysql "${mysql_auth_args[@]}" <<SQL
 CREATE DATABASE IF NOT EXISTS \`$database_name\` CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
 CREATE USER IF NOT EXISTS '$runtime_user'@'$docker_host_pattern' IDENTIFIED BY '$runtime_password';
 CREATE USER IF NOT EXISTS '$migration_user'@'$docker_host_pattern' IDENTIFIED BY '$migration_password';
