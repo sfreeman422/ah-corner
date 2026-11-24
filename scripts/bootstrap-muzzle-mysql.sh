@@ -68,8 +68,11 @@ if [[ "${AH_CORNER_MYSQL_AUTH:-password}" == "password" ]]; then
   echo "MySQL will prompt for its root password (which may differ from your sudo password)."
 fi
 
-runtime_password="$(openssl rand -hex 32)"
-migration_password="$(openssl rand -hex 32)"
+# Hex supplies entropy; the suffix also satisfies MySQL's common mixed-case,
+# digit, and special-character policy. All characters are safe in the URL,
+# dotenv file, and the SQL string below.
+runtime_password="$(openssl rand -hex 32)Aa1!"
+migration_password="$(openssl rand -hex 32)Aa1!"
 
 # Supply SQL on stdin rather than as command-line arguments, keeping generated
 # passwords out of process listings. Values are constrained/generated above.
