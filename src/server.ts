@@ -82,8 +82,10 @@ const collectSchedule=process.env.COLLECT_SCHEDULE||'interval';
 if(!['interval','cron'].includes(collectSchedule))throw Error('COLLECT_SCHEDULE must be interval or cron');
 const demo=mode==='demo';
 const house=Number(process.env.HOUSE_ID);
+const houseVerified=!demo&&process.env.HOUSE_VERIFIED==='true';
+const provisional=!demo&&!houseVerified;
 const blizzard=new Blizzard();
-if(!demo&&(!validInt(house)||process.env.HOUSE_VERIFIED!=='true'))throw Error('Live mode requires HOUSE_ID and HOUSE_VERIFIED=true after discovery and manual confirmation');
+if(!demo&&(!validInt(house)||(!houseVerified&&process.env.ALLOW_UNVERIFIED_HOUSE!=='true')))throw Error('Live mode requires HOUSE_ID and either HOUSE_VERIFIED=true after confirmation or ALLOW_UNVERIFIED_HOUSE=true for provisional data');
 
 const market=demo?'demo-us-pvp-horde':`${blizzard.region}:${blizzard.ruleset}:${house}`;
 const settings:Settings={
@@ -134,9 +136,14 @@ function save(){
 
 function latest(){return snapshots.at(-1);}
 
+function marketScan(snapshot:NonNullable<ReturnType<typeof latest>>,configured:Settings){
+ const rows=scan(snapshot,snapshots,configured);
+ return provisional?rows.map(row=>({...row,confidence:'watch' as const,reasons:['Auction house mapping is unverified; compare in-game prices before acting.',...row.reasons]})):rows;
+}
+
 function refresh(){
  const snapshot=latest();
- cached=snapshot?scan(snapshot,snapshots,settings):[];
+ cached=snapshot?marketScan(snapshot,settings):[];
 }
 
 function expireInMemorySnapshots(){
@@ -146,7 +153,7 @@ function expireInMemorySnapshots(){
 }
 
 async function alerts(){
- if(demo)return;
+ if(demo||provisional)return;
  const snapshot=latest();
  if(!snapshot||Date.now()-snapshot.at>2*3_600_000)return;
  for(const opportunity of cached.filter(value=>value.confidence==='candidate').slice(0,5)){
@@ -334,7 +341,7 @@ const server=createServer(async(request,response)=>{
    requireMethod(method,'GET');
    if(expireLiveState())await save();
    const snapshot=latest();
-   json(response,{mode,market,at:snapshot?.at||null,listingCount:snapshot?.listings.length||0,snapshots:snapshots.length,collector:{busy,lastChecked,lastSuccess,lastError:lastCollectionError||null,nextScheduledAt:collectSchedule==='interval'&&lastChecked?lastChecked+pollMinutes*60_000:null},settings,watch:state.watch,names:state.names,stale:!snapshot||Date.now()-snapshot.at>7_200_000});
+   json(response,{mode,market,houseVerified,at:snapshot?.at||null,listingCount:snapshot?.listings.length||0,snapshots:snapshots.length,collector:{busy,lastChecked,lastSuccess,lastError:lastCollectionError||null,nextScheduledAt:collectSchedule==='interval'&&lastChecked?lastChecked+pollMinutes*60_000:null},settings,watch:state.watch,names:state.names,stale:!snapshot||Date.now()-snapshot.at>7_200_000});
    return;
   }
   if(path==='/api/opportunities'){
@@ -345,7 +352,7 @@ const server=createServer(async(request,response)=>{
    try{configured=validSettings({...settings,bankroll,minROI});}
    catch{fail(422,'INVALID_FILTERS','The bankroll or ROI filter is invalid.', 'Enter a positive bankroll and an ROI between 0% and 1000%.');}
    const snapshot=latest();
-   const rows=snapshot?(configured.bankroll===settings.bankroll&&configured.minROI===settings.minROI?cached:scan(snapshot,snapshots,configured)):[];
+   const rows=snapshot?(configured.bankroll===settings.bankroll&&configured.minROI===settings.minROI?cached:marketScan(snapshot,configured)):[];
    json(response,{rows:rows.slice(0,100),mode,at:snapshot?.at});
    return;
   }
@@ -358,13 +365,13 @@ const server=createServer(async(request,response)=>{
   }
   if(path==='/api/backtest'){
    requireMethod(method,'GET');
-   json(response,backtest(snapshots,settings));
+   json(response,provisional?[]:backtest(snapshots,settings));
    return;
   }
   if(path==='/api/alerts'){
    requireMethod(method,'GET');
    if(expireLiveState())await save();
-   json(response,state.alerts);
+   json(response,provisional?[]:state.alerts);
    return;
   }
   if(path==='/api/portfolio'){
@@ -427,8 +434,8 @@ const server=createServer(async(request,response)=>{
   if(path==='/api/addon.lua'){
    requireMethod(method,'GET');
    const snapshot=latest();
-   const rows=(!demo&&snapshot&&Date.now()-snapshot.at<7_200_000?cached.filter(value=>value.confidence==='candidate'):[]).slice(0,20);
-   const code=`-- Generated advisory data. No game actions.\nAHCornerPlan = { market=${luaString(market)}, timestamp=${Math.floor((snapshot?.at||0)/1_000)}, rows={\n${rows.map(value=>`{id=${value.itemId}, name=${luaString(state.names[value.itemId]||`Item #${value.itemId}`)}, quantity=${value.quantity}, cost=${value.cost}, buyMax=${value.buyMax}, target=${value.target}},`).join('\n')}\n}}\n`;
+   const rows=(!demo&&!provisional&&snapshot&&Date.now()-snapshot.at<7_200_000?cached.filter(value=>value.confidence==='candidate'):[]).slice(0,20);
+   const code=`-- Generated advisory data. No game actions.\n${provisional?'-- Auction house mapping is unverified; no actionable entries.\n':''}AHCornerPlan = { market=${luaString(market)}, timestamp=${Math.floor((snapshot?.at||0)/1_000)}, rows={\n${rows.map(value=>`{id=${value.itemId}, name=${luaString(state.names[value.itemId]||`Item #${value.itemId}`)}, quantity=${value.quantity}, cost=${value.cost}, buyMax=${value.buyMax}, target=${value.target}},`).join('\n')}\n}}\n`;
    response.writeHead(200,{'Content-Type':'text/plain; charset=utf-8','Content-Disposition':'attachment; filename="Plan.lua"','Cache-Control':'no-store','X-Content-Type-Options':'nosniff','Referrer-Policy':'no-referrer','X-Frame-Options':'DENY'});
    response.end(code);
    return;

@@ -44,7 +44,7 @@ const unit=(c:number)=>c>=10_000?`${(c/10_000).toFixed(4)}g`:`${(c/100).toFixed(
 const pct=(n:number)=>`${Math.round(n*100)}%`;
 
 type Collector={busy:boolean;lastChecked:number;lastSuccess:number;lastError:PublicProblem|null;nextScheduledAt:number|null};
-type Status={mode:string;market:string;at:number|null;listingCount:number;snapshots:number;collector:Collector;settings:Settings;watch:number[];names:Record<number,string>;stale:boolean};
+type Status={mode:string;market:string;houseVerified:boolean;at:number|null;listingCount:number;snapshots:number;collector:Collector;settings:Settings;watch:number[];names:Record<number,string>;stale:boolean};
 type Position={itemId:number;quantity:number;basis:number;realized:number;unmatched:number};
 type Backtest={at:number;itemId:number;target:number;cost:number;potentialProfit:number;competingUnits:number;held:boolean};
 
@@ -113,6 +113,7 @@ function App({onLogout}:{onLogout?:()=>void}){
  const filtered=rows.filter(row=>(!onlyWatch||status?.watch.includes(row.itemId))&&name(row.itemId).toLowerCase().includes(query.toLowerCase()));
  const max=Math.max(1,...history.map(stat=>stat.floor));
  const sourceLabel=status?.mode==='demo'?'SIMULATED DATA':status?.stale?'STALE DATA':status?.collector.lastError?'REFRESH ISSUE':'LIVE SOURCE';
+ const provisional=status?.mode==='live'&&!status.houseVerified;
 
  return <>
   <header>
@@ -125,6 +126,7 @@ function App({onLogout}:{onLogout?:()=>void}){
     <button disabled={status?.collector.busy} onClick={()=>action(()=>api('collect',{}),'Market refresh started. The status panel will update when it finishes.')}>{status?.collector.busy?'Refreshing source…':'↻ Refresh source'}</button>
    </div>
    {status?.mode==='demo'&&<div className="banner">Demo mode — all market snapshots are synthetic. No live trade recommendations or outbound alerts.</div>}
+   {provisional&&<div className="banner bad" role="alert"><strong>Unverified auction house.</strong> These are live prices from house {status?.market.split(':').at(-1)}, but its US PvP Horde mapping has not been verified in-game. Opportunities are watch-only; alerts, backtesting and addon plans are disabled until verification.</div>}
    {status?.collector.lastError&&<div className="banner bad" role="alert"><strong>{status.collector.lastError.message}</strong>{status.collector.lastError.action&&<span> {status.collector.lastError.action}</span>}</div>}
    {error&&<div className="banner bad" role="alert"><strong>{error.message}</strong>{error.action&&<span> {error.action}</span>}</div>}
    {notice&&<div className="banner" role="status">{notice} <button onClick={()=>setNotice('')}>Dismiss</button></div>}
@@ -158,7 +160,7 @@ function App({onLogout}:{onLogout?:()=>void}){
        {history.length?<svg viewBox="0 0 300 80" role="img" aria-label="Historical floor price chart"><path d="M0 75H300 M0 5H300" stroke="#36454b"/><polyline points={history.map((stat,index)=>`${index*300/Math.max(1,history.length-1)},${75-stat.floor/max*70}`).join(' ')} fill="none" stroke="#67c7ad" strokeWidth="2.5"/></svg>:<p>No history yet.</p>}
        <div className="three"><div><small>PRICE SUPPORT</small><strong>{pct(active.support)}</strong></div><div><small>REMOVED / HR*</small><strong>{active.removedUnits?.toFixed(1)??'—'}</strong></div><div><small>NEW / HR*</small><strong>{active.replenish?.toFixed(1)??'—'}</strong></div></div>
        <p className="muted">* Auction disappearance is not a sale. {active.historyCount} prior observations. Profit excludes failed deposits; verify exact in-game listings.</p>
-       <button onClick={()=>{if(!navigator.clipboard){setError({code:'CLIPBOARD_UNAVAILABLE',message:'Clipboard access is unavailable in this browser.',action:'Copy the item name manually.'});return;}void navigator.clipboard.writeText(name(active.itemId)).then(()=>setNotice('Item name copied.')).catch(()=>setError({code:'CLIPBOARD_UNAVAILABLE',message:'Clipboard access was blocked.',action:'Copy the item name manually.'}));}}>Copy item name</button> <a className="button" href="/api/addon.lua" download="Plan.lua">Export plan</a>
+       <button onClick={()=>{if(!navigator.clipboard){setError({code:'CLIPBOARD_UNAVAILABLE',message:'Clipboard access is unavailable in this browser.',action:'Copy the item name manually.'});return;}void navigator.clipboard.writeText(name(active.itemId)).then(()=>setNotice('Item name copied.')).catch(()=>setError({code:'CLIPBOARD_UNAVAILABLE',message:'Clipboard access was blocked.',action:'Copy the item name manually.'}));}}>Copy item name</button> {provisional?<button disabled title="Verify the auction house before exporting a plan">Export plan</button>:<a className="button" href="/api/addon.lua" download="Plan.lua">Export plan</a>}
       </>:<p>Select an item when opportunities are available.</p>}
      </section>
     </div>
@@ -179,7 +181,7 @@ function App({onLogout}:{onLogout?:()=>void}){
    </section>}
    {tab==='Backtest'&&<section className="panel"><h3>Historical forward check</h3><p>Evaluates candidates using only data available at the decision time, then checks competing supply in the next snapshot. No simulated sales or claimed profit. Uses server-configured bankroll and ROI.</p><div className="three"><div><small>OBSERVATIONS</small><strong>{backtests.length}</strong></div><div><small>NO LOWER COMPETING SUPPLY</small><strong>{backtests.length?pct(backtests.filter(value=>value.held).length/backtests.length):'—'}</strong></div></div><table><thead><tr><th>Decision time</th><th>Item</th><th>Target</th><th>Next snapshot below target</th><th>Held</th></tr></thead><tbody>{backtests.slice(-100).reverse().map((value,index)=><tr key={index}><td>{new Date(value.at).toLocaleString()}</td><td>{name(value.itemId)}</td><td>{unit(value.target)}</td><td>{value.competingUnits}</td><td>{value.held?'Yes':'No'}</td></tr>)}</tbody></table></section>}
    {tab==='Alerts'&&<section className="panel"><h3>Candidate alerts</h3><p>Deduplicated live candidates, stored locally. Optional webhook configured in .env. Demo mode never sends alerts.</p><table><thead><tr><th>Time</th><th>Item</th><th>Buyout</th><th>Target</th><th>Potential profit</th></tr></thead><tbody>{alerts.map((alert,index)=><tr key={index}><td>{new Date(alert.at).toLocaleString()}</td><td>{name(alert.itemId)}</td><td>{money(alert.cost)}</td><td>{unit(alert.target)}</td><td>{money(alert.profit)}</td></tr>)}</tbody></table>{!alerts.length&&<p>No live alerts recorded.</p>}</section>}
-   {tab==='Setup'&&<section className="panel"><h3>Connect your auction house</h3><p>Read README.md for server and local setup. Create a Battle.net API client, enter credentials in .env, discover and compare two in-game items, then pin the verified HOUSE_ID. Restart in live mode. Never share secrets.</p><p>Install addon/AHCorner into the Forever client Interface/AddOns folder. Download Plan.lua below and replace the addon file while logged out, then log in. Use /ahc help. Journal entries are manual and importable after logout or /reload.</p><a href="/api/addon.lua" className="button" download="Plan.lua">Download advisory plan</a><p>Market data is delayed. All in-game execution remains manual.</p></section>}
+   {tab==='Setup'&&<section className="panel"><h3>Connect your auction house</h3><p>Read README.md for server and local setup. Create a Battle.net API client, enter credentials in .env, discover and compare two in-game items, then pin the verified HOUSE_ID. Restart in live mode. Never share secrets.</p><p>Install addon/AHCorner into the Forever client Interface/AddOns folder. Download Plan.lua below and replace the addon file while logged out, then log in. Use /ahc help. Journal entries are manual and importable after logout or /reload.</p>{provisional?<button disabled title="Verify the auction house before downloading a plan">Download advisory plan</button>:<a href="/api/addon.lua" className="button" download="Plan.lua">Download advisory plan</a>}<p>Market data is delayed. All in-game execution remains manual.</p></section>}
    <footer>AH Corner · local-first · prices in copper internally · not affiliated with Blizzard</footer>
   </main>
  </>;
