@@ -116,7 +116,7 @@ docker compose run --rm app npm run migrate
 docker compose up -d --force-recreate app
 
 for _ in {1..20}; do
-  if curl -fsS http://127.0.0.1:3003/readyz; then
+  if curl -fsS -H 'Host: ah.muzzle.lol' http://127.0.0.1:3003/readyz; then
     echo
     echo "AH Corner is ready at https://ah.muzzle.lol (HTTP Basic Auth required)."
     exit 0

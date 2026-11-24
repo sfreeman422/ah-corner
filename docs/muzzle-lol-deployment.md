@@ -65,7 +65,7 @@ cd /home/muzzle.lol/ah-corner
 docker compose build app
 docker compose run --rm app npm run migrate
 docker compose up -d app
-curl -fsS http://127.0.0.1:3003/readyz
+curl -fsS -H 'Host: ah.muzzle.lol' http://127.0.0.1:3003/readyz
 ```
 
 If migration fails, its message distinguishes an invalid URL, missing privileges, an unavailable MySQL service, and migration-lock contention. Do not start the public proxy until `/readyz` succeeds.
