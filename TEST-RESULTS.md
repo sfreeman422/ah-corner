@@ -8,5 +8,5 @@ Validated on 2026-11-24 with Node.js 24.21.0 and npm 11.19.0:
 - `npm run typecheck` passed.
 - `npm run build` passed with Vite 6.4.6.
 - `npm audit` reported no known production or development dependency vulnerabilities.
-- `docker compose config --quiet` passed. A Docker image build and a live MySQL/MariaDB migration were not run here because this account cannot access the local Docker daemon and no target database credentials were supplied.
+- `docker compose config --quiet` passed. The local Docker daemon is unavailable, but the production image built successfully on `muzzle.lol`, including its in-image build and test suite. Its host configuration resolves to loopback `127.0.0.1:3003` and deliberately fails closed with `DATABASE_URL is required for this deployment` until a MySQL application account is configured. A live MySQL/MariaDB migration was not run because no target database credentials were supplied.
 - Live Blizzard collection, webhook delivery, reverse-proxy authentication, bare-metal MySQL/MariaDB connectivity/TLS, backup restore, and in-game addon behavior still require validation in the target environment.
