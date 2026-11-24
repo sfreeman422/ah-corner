@@ -15,12 +15,12 @@ npm run server
 
 Open http://127.0.0.1:3000. The default **demo** mode loads synthetic hourly data, provides a working scanner and journal, and disables live alerts and actionable addon exports. Demo and live state are separated. For UI development, run `npm run server` in one terminal and `npm run dev` in another (http://127.0.0.1:5173).
 
-## Docker deployment with an existing PostgreSQL server
+## Docker deployment with an existing MySQL or MariaDB server
 
-The Docker Compose file starts **only the AH Corner application**. It never starts PostgreSQL or generates a database URL. The app container connects to the PostgreSQL server you already operate.
+The Docker Compose file starts **only the AH Corner application**. It never starts a database or generates a database URL. The app container connects to the MySQL or MariaDB server you already operate.
 
-1. Create an application database and a least-privilege runtime role. For the first migration, use a separate migrator role that can create tables; set its URL as `DATABASE_MIGRATION_URL`. The runtime `DATABASE_URL` needs only access to AH Corner's tables plus `SELECT` on `schema_migrations`.
-2. Copy `.env.example` to `.env`, set `DATABASE_URL`, and choose `DATABASE_SSL=verify-full` for a TLS PostgreSQL connection. Do not add `sslmode` parameters to the URL: TLS policy is controlled by `DATABASE_SSL`. If the server uses a private CA, mount its PEM certificate into the container and set `DATABASE_SSL_CA_FILE` to that in-container path. `DATABASE_SSL=disable` is only appropriate when you deliberately operate a private local database link.
+1. A dedicated `ahcorner` database and least-privilege user are preferred, but an existing shared schema is supported: AH Corner creates only `ah_corner_state`, `ah_corner_snapshots`, and `ah_corner_schema_migrations`. Keep those names reserved for this app. The runtime user needs `SELECT`, `INSERT`, `UPDATE`, and `DELETE` on the first two tables plus `SELECT` on the migration table. Run `npm run migrate` with a user allowed to create and later alter those tables; set that optional connection as `DATABASE_MIGRATION_URL` (or use `DATABASE_URL` for the simplest initial setup).
+2. Copy `.env.example` to `.env` and set a `mysql://` `DATABASE_URL`, for example `mysql://ahcorner_runtime:encoded-password@host.docker.internal:3306/shared_database`. Percent-encode reserved username/password characters. Do not put TLS settings in the URL: use `DATABASE_SSL=verify-full` for a TLS MySQL/MariaDB connection and, for a private CA, mount its PEM certificate into the container and set `DATABASE_SSL_CA_FILE` to the in-container path. `DATABASE_SSL=disable` is appropriate only for a deliberately private local database link, such as the Docker-host gateway.
 3. Set `APP_TRUSTED_HOSTS` and `APP_TRUSTED_ORIGINS` to the exact public hostname and HTTPS origin used by your reverse proxy. Keep `BIND_ADDRESS=127.0.0.1` unless the proxy is on another machine.
 4. Build, migrate once, then start the single application container:
 
@@ -31,9 +31,11 @@ docker compose up -d app
 docker compose logs -f app
 ```
 
-When PostgreSQL is on the same Docker host, `host.docker.internal` is available inside the container as a convenient hostname. Otherwise use the database server's DNS name or private IP and allow the Docker host through PostgreSQL's network policy. The app exposes `/livez` and database-aware `/readyz`; Compose uses `/readyz` as its health check.
+When MySQL/MariaDB is on the same Docker host, Compose maps `host.docker.internal` to Docker's host gateway, so the container can reach the bare-metal database without publishing MySQL in another container. Otherwise use the database server's DNS name or private IP and allow the Docker host through MySQL's bind address and user grants. The app exposes `/livez` and database-aware `/readyz`; Compose uses `/readyz` as its health check. A missing URL, an uninitialized schema, an invalid MySQL URL, or a database outage produces a specific startup/readiness error instead of silently falling back to local files.
 
-Put an authenticated TLS reverse proxy in front of the application before exposing it to anyone. Host/origin checks are not authentication. The app is single-user today, so do not make it public without an access-control layer. Use the PostgreSQL server's backups/PITR and practice restores; the app intentionally retains only the newest 25 raw snapshots per market.
+Put an authenticated TLS reverse proxy in front of the application before exposing it to anyone. Host/origin checks are not authentication. The app is single-user today, so do not make it public without an access-control layer. Use the MySQL/MariaDB server's backups and point-in-time recovery where available, and practice restores; the app intentionally retains only the newest 25 raw snapshots per market.
+
+For the current `muzzle.lol` host layout, use the tailored [deployment guide](docs/muzzle-lol-deployment.md).
 
 ## Connect live Blizzard data
 
@@ -60,7 +62,7 @@ npm run discover -- 2589 2770
 - Estimate proceeds after commission (conservatively rounded per unit), hypothetical upside and break-even units. Unsold units, deposits and opportunity cost are excluded from projected cash profit. Nothing is a guaranteed sale.
 - Candidate gating: at least six prior item observations by default, target supported by at least 25% of prior floors and at/below historical 75th percentile, positive observed removals, replenishment no faster than removals, and fresh data. Otherwise watch-only. Score uses removal velocity 25%, ROI 25%, cost 20%, replenishment 15%, historical support 10%, freshness 5%. Weights are heuristics, not calibrated probabilities.
 - Removed listings/quantity can mean sales, cancellations, expiration or changes. They are not verified trades. Backtest is a conservative *forward price support diagnostic*: compare candidate target with the next observed competing book, without claiming simulated sales or realized profits. It is not a causal execution simulation; the historical book did not actually undergo your buyout. It does not model queue priority, demand elasticity or fills.
-- History retention: last 25 distinct raw snapshots per market (roughly one day at hourly refresh). This MVP intentionally bounds memory and disk use; larger markets can still require substantial RAM/storage (allow at least 2–4 GB). Raw snapshots are JSONB in PostgreSQL. Long-run analytics should move to compact aggregated time series and partitioned auction data; extended retention and incremental backtesting are future improvements. No historic market data is bundled apart from synthetic fixtures.
+- History retention: last 25 distinct raw snapshots per market (roughly one day at hourly refresh). This MVP intentionally bounds memory and disk use; larger markets can still require substantial RAM/storage (allow at least 2–4 GB). Raw snapshots are stored as JSON in MySQL/MariaDB. Long-run analytics should move to compact aggregated time series and partitioned auction data; extended retention and incremental backtesting are future improvements. No historic market data is bundled apart from synthetic fixtures.
 - Backtest, alerts and addon plan use server-configured settings. A dashboard filter is exploratory. Data is delayed, and every candidate needs actual manual in-game verification. If the lowest tier is replenishing faster than you can sell, stop defending the reset.
 
 ## Companion addon
@@ -88,7 +90,7 @@ npm run typecheck
 npm run build
 ```
 
-Tests include normalization, stack economics, caps, mixed auction types, synthetic scoring/backtest, accounting, safe journal parsing, mocked OAuth/collector response handling, database fail-closed configuration, health endpoints, and safe validation errors. The smoke script boots the demo backend in a temporary data directory and checks API behavior end to end. See `TEST-RESULTS.md` for the current validation record. Live Blizzard authentication, webhook delivery, reverse-proxy authentication, bare-metal PostgreSQL connectivity/TLS, backup restore, and in-game addon behavior must still be validated in the target environment. No live gold has been spent. This is a first implementation, not a production-certified service.
+Tests include normalization, stack economics, caps, mixed auction types, synthetic scoring/backtest, accounting, safe journal parsing, mocked OAuth/collector response handling, database fail-closed configuration, health endpoints, and safe validation errors. The smoke script boots the demo backend in a temporary data directory and checks API behavior end to end. See `TEST-RESULTS.md` for the current validation record. Live Blizzard authentication, webhook delivery, reverse-proxy authentication, bare-metal MySQL/MariaDB connectivity/TLS, backup restore, and in-game addon behavior must still be validated in the target environment. No live gold has been spent. This is a first implementation, not a production-certified service.
 
 ## API references / implementation provenance
 

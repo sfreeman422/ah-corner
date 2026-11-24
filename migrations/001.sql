@@ -1,3 +1,13 @@
-CREATE TABLE IF NOT EXISTS snapshots (market text NOT NULL, key text NOT NULL, at bigint NOT NULL, data jsonb NOT NULL, PRIMARY KEY(market,key));
-CREATE INDEX IF NOT EXISTS snapshots_market_at ON snapshots(market,at DESC);
-CREATE TABLE IF NOT EXISTS state (market text PRIMARY KEY, data jsonb NOT NULL);
+CREATE TABLE IF NOT EXISTS ah_corner_snapshots (
+  market varchar(191) NOT NULL,
+  snapshot_key varchar(191) NOT NULL,
+  recorded_at bigint NOT NULL,
+  data JSON NOT NULL,
+  PRIMARY KEY (market, snapshot_key),
+  KEY ah_corner_snapshots_market_at (market, recorded_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS ah_corner_state (
+  market varchar(191) NOT NULL PRIMARY KEY,
+  data JSON NOT NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

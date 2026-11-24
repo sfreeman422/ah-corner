@@ -55,19 +55,19 @@ function errorMessage(error:unknown){return error instanceof Error?error.message
 
 function databaseProblem(error:unknown){
  const code=(error as {code?:string}).code||'';
- return code.startsWith('08')||['3D000','53300','57P01','57P02','57P03','ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENETUNREACH','EHOSTUNREACH','ENOTFOUND'].includes(code);
+ return code.startsWith('ER_')||code.startsWith('08')||['3D000','53300','57P01','57P02','57P03','ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENETUNREACH','EHOSTUNREACH','ENOTFOUND'].includes(code);
 }
 
 function responseProblem(error:unknown):RequestProblem{
  if(error instanceof RequestProblem)return error;
- if(databaseProblem(error))return new RequestProblem(503,{code:'DATABASE_UNAVAILABLE',message:'Saved data is temporarily unavailable. No changes were made.',action:'Try again shortly. If this continues, check the PostgreSQL service.'});
+ if(databaseProblem(error))return new RequestProblem(503,{code:'DATABASE_UNAVAILABLE',message:'Saved data is temporarily unavailable. No changes were made.',action:'Try again shortly. If this continues, check the MySQL service.'});
  console.error('Request failed:',error);
  return new RequestProblem(500,{code:'INTERNAL_ERROR',message:'AH Corner could not complete that request.',action:'Try again. If the problem continues, check the server logs.'});
 }
 
 function collectorProblem(error:unknown):PublicProblem{
  const message=errorMessage(error);
- if(databaseProblem(error))return {code:'DATABASE_UNAVAILABLE',message:'The database is unavailable, so the market refresh could not be saved.',action:'The app will retry on its next scheduled refresh. Check PostgreSQL if this persists.'};
+ if(databaseProblem(error))return {code:'DATABASE_UNAVAILABLE',message:'The database is unavailable, so the market refresh could not be saved.',action:'The app will retry on its next scheduled refresh. Check MySQL if this persists.'};
  if(/credentials|oauth http 401|oauth http 403/i.test(message))return {code:'BLIZZARD_AUTH',message:'Blizzard sign-in failed.',action:'Check the Battle.net client ID and secret, then restart the service.'};
  if(/http 429|rate.?limit/i.test(message))return {code:'BLIZZARD_RATE_LIMIT',message:'Blizzard is rate-limiting market updates.',action:'The app will retry automatically. The most recent successful snapshot remains available.'};
  if(/abort|timeout|timed out|fetch failed/i.test(message))return {code:'BLIZZARD_NETWORK',message:'AH Corner could not reach Blizzard.',action:'The app will retry automatically. Check the server connection if this continues.'};
