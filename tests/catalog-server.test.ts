@@ -14,7 +14,7 @@ test('live catalog classifications persist across restart without treating missi
  const now=Date.now();
  const snapshots=demoSnapshots(now).map((snapshot,index)=>({...snapshot,market:'us:1:113',source:'blizzard' as const,key:`catalog-${index}`}));
  for(const snapshot of snapshots)await writeFile(join(marketDir,`snap-${snapshot.at}-${snapshot.key}.json`),JSON.stringify(snapshot));
- await writeFile(join(marketDir,'state.json'),JSON.stringify({names,namesFetchedAt:now,watch:[],trades:[],alerts:[],recipeIndex:{dataset:'fixture',build:'fixture',fetchedAt:now}}));
+ await writeFile(join(marketDir,'state.json'),JSON.stringify({names,nameSources:{4402:'classic-era',3182:'forever'},namesFetchedAt:now,watch:[],trades:[],alerts:[],recipeIndex:{dataset:'fixture',build:'fixture',fetchedAt:now}}));
  const probe=createServer();probe.listen(0,'127.0.0.1');await once(probe,'listening');
  const port=(probe.address() as {port:number}).port;await new Promise<void>(resolve=>probe.close(()=>resolve()));
  const origin=`http://127.0.0.1:${port}`;
@@ -30,8 +30,8 @@ test('live catalog classifications persist across restart without treating missi
   }
   throw Error(`server failed to start: ${stderr}`);
  }
- async function status(){return (await (await fetch(`${origin}/api/status`)).json()) as {itemCatalog?:{dataset:string;items:Record<string,{classId:number;subclassId:number;updatedAt:number}>;missingIds?:number[]}};}
- async function rows(){return (await (await fetch(`${origin}/api/opportunities`)).json()).rows as {itemId:number;confidence:string;reasons:string[]}[];}
+ async function status(){return (await (await fetch(`${origin}/api/status`)).json()) as {names:Record<string,string>;nameSources:Record<string,string>; itemCatalog?:{dataset:string;items:Record<string,{classId:number;subclassId:number;updatedAt:number}>;missingIds?:number[]}};}
+ async function rows(query=''){return (await (await fetch(`${origin}/api/opportunities${query}`)).json()).rows as {itemId:number;confidence:string;reasons:string[]}[];}
  async function post(value:unknown){return fetch(`${origin}/api/item-use`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(value)});}
  async function calls(){try{return (await readFile(join(dir,'catalog-calls'),'utf8')).trim().split('\n').filter(Boolean);}catch{return [];}}
  async function waitFor(predicate:()=>Promise<boolean>){for(let i=0;i<200;i++){if(await predicate())return;await new Promise(resolve=>setTimeout(resolve,50));}assert.fail('Timed out waiting for the catalog update');}
@@ -48,6 +48,14 @@ test('live catalog classifications persist across restart without treating missi
   assert.ok(catalog.missingIds?.includes(10938),'successful missing results are recorded');
   await waitFor(async()=>(await rows()).find(row=>row.itemId===4402)?.confidence==='candidate');
   const visible=await rows();
+  const classifiedStatus=await status();
+  assert.equal(classifiedStatus.names['4402'],'Sample food','Forever catalog name replaces a Classic fallback');
+  assert.equal(classifiedStatus.nameSources['4402'],undefined,'catalog name is no longer labeled as Classic');
+  assert.equal(classifiedStatus.names['3182'],names[3182],'official Forever name takes precedence');
+  assert.deepEqual((await rows('?q=Sample%20food')).map(row=>row.itemId),[4402]);
+  assert.match(await (await fetch(`${origin}/api/addon.lua`)).text(),/name="Sample food"/);
+  assert.equal(visible[0].confidence,'candidate','default action sort puts candidates first');
+  assert.equal((await rows('?sort=action&direction=asc'))[0].confidence,'watch','reversing action sort puts hold-off rows first');
   assert.equal(visible.find(row=>row.itemId===3182)?.confidence,'watch','generic trade-goods class alone does not prove useful demand');
   assert.equal(visible.find(row=>row.itemId===10561)?.confidence,'watch','miscellaneous class alone does not promote junk');
   assert.equal(visible.find(row=>row.itemId===10938)?.confidence,'watch','a missing catalog item is unknown');

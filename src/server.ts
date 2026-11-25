@@ -17,7 +17,7 @@ import {ItemMetadataResolver} from './item-metadata-resolver.ts';
 import {fetchRecipeIndex} from './recipe-index.ts';
 import type {BlizzardItemMetadata,BlizzardItemMetadataMap,RecipeUseMap} from './item-use.ts';
 import type {ItemMetadata} from './blizzard.ts';
-import {defaultOpportunitySort,sortOpportunities} from './opportunity-sort.ts';
+import {defaultOpportunitySort,opportunitySortKeys,sortOpportunities} from './opportunity-sort.ts';
 import type {OpportunitySort,OpportunitySortKey} from './opportunity-sort.ts';
 
 type PublicProblem={code:string;message:string;action?:string};
@@ -242,6 +242,12 @@ function catalogName(id:number){
  return itemCategoryFor(id,{},state.itemCatalog)&&typeof item?.name==='string'&&item.name.trim()?item.name:undefined;
 }
 
+function knownItemName(id:number){
+ const stored=state.names[id];
+ const known=stored&&stored!==`Item #${id}`?stored:undefined;
+ return state.nameSources?.[id]==='forever'&&known?known:catalogName(id)||known;
+}
+
 function decorateScan(base:Opportunity[]){
  const rows=applyItemUse(base,state.itemUses||{},state.recipeUses||{},state.blizzardMetadata||{},state.itemCatalog);
  return provisional?rows.map(row=>({...row,confidence:'watch' as const,reasons:['Auction house mapping is unverified; compare in-game prices before acting.',...row.reasons]})):rows;
@@ -399,7 +405,7 @@ async function alerts(){
   await save();
   if(process.env.ALERT_WEBHOOK_URL){
    try{
-    const response=await fetch(process.env.ALERT_WEBHOOK_URL,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({content:`AH Corner candidate: ${state.names[opportunity.itemId]||`Item #${opportunity.itemId}`} | buyout ${(opportunity.cost/10_000).toFixed(2)}g | target ${(opportunity.target/10_000).toFixed(4)}g/unit | potential profit ${(opportunity.profit/10_000).toFixed(2)}g. Verify live AH; no verified sales.`}),signal:AbortSignal.timeout(10_000)});
+    const response=await fetch(process.env.ALERT_WEBHOOK_URL,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({content:`AH Corner candidate: ${knownItemName(opportunity.itemId)||`Item #${opportunity.itemId}`} | buyout ${(opportunity.cost/10_000).toFixed(2)}g | target ${(opportunity.target/10_000).toFixed(4)}g/unit | potential profit ${(opportunity.profit/10_000).toFixed(2)}g. Verify live AH; no verified sales.`}),signal:AbortSignal.timeout(10_000)});
     if(!response.ok)console.warn('Webhook HTTP',response.status);
    }catch{console.warn('Webhook delivery failed');}
   }
@@ -583,15 +589,16 @@ const server=createServer(async(request,response)=>{
    const snapshot=latest();
    const catalogNames:Record<number,string>={};
    for(const id of Object.keys(state.itemCatalog?.items||{})){const name=catalogName(Number(id));if(name)catalogNames[Number(id)]=name;}
-   const names={...catalogNames};
-   for(const [id,name] of Object.entries(state.names))if(name&&name!==`Item #${id}`)names[Number(id)]=name;
+   const names={...catalogNames},nameSources={...state.nameSources};
+   for(const id of Object.keys(catalogNames))if(nameSources[Number(id)]!=='forever')delete nameSources[Number(id)];
+   for(const [id,name] of Object.entries(state.names))if(name&&name!==`Item #${id}`&&(!catalogNames[Number(id)]||state.nameSources?.[Number(id)]==='forever'))names[Number(id)]=name;
    let classified=0,knownUses=0;
    if(snapshot)for(const id of snapshot.items.keys()){
     const use=itemUseFor(state.itemUses||{},id,state.recipeUses||{},state.blizzardMetadata||{},state.itemCatalog);
     if(use&&use.kind!=='exclude')knownUses++;
     if(itemCategoryFor(id,state.blizzardMetadata||{},state.itemCatalog))classified++;
    }
-   json(response,{mode,market,houseVerified,at:snapshot?.at||null,listingCount:snapshot?.listingCount||0,snapshots:snapshots.length,collector:{busy,lastChecked,lastSuccess,lastError:lastCollectionError||null,nextScheduledAt:collectSchedule==='interval'&&lastChecked?lastChecked+pollMinutes*60_000:null},settings:userSettings,watch:state.watch,names,nameSources:state.nameSources||{},itemUses:state.itemUses||{},recipeUses:state.recipeUses||{},blizzardMetadata:state.blizzardMetadata||{},itemCatalog:state.itemCatalog||null,catalogLookup:{busy:catalogBusy,error:catalogError,classified,knownUses,total:snapshot?.items.size||0},metadataError,recipeIndex:state.recipeIndex||null,recipeLookup:{busy:recipeBusy,error:recipeError},stale:!snapshot||Date.now()-snapshot.at>7_200_000});
+   json(response,{mode,market,houseVerified,at:snapshot?.at||null,listingCount:snapshot?.listingCount||0,snapshots:snapshots.length,collector:{busy,lastChecked,lastSuccess,lastError:lastCollectionError||null,nextScheduledAt:collectSchedule==='interval'&&lastChecked?lastChecked+pollMinutes*60_000:null},settings:userSettings,watch:state.watch,names,nameSources,itemUses:state.itemUses||{},recipeUses:state.recipeUses||{},blizzardMetadata:state.blizzardMetadata||{},itemCatalog:state.itemCatalog||null,catalogLookup:{busy:catalogBusy,error:catalogError,classified,knownUses,total:snapshot?.items.size||0},metadataError,recipeIndex:state.recipeIndex||null,recipeLookup:{busy:recipeBusy,error:recipeError},stale:!snapshot||Date.now()-snapshot.at>7_200_000});
    return;
   }
   if(path==='/api/settings'){
@@ -642,8 +649,8 @@ const server=createServer(async(request,response)=>{
    if(search.length>120||(watch!==null&&watch!=='0'&&watch!=='1')||(named!==null&&named!=='0'&&named!=='1'))fail(422,'INVALID_FILTERS','The opportunity filters are invalid.','Use a search of at most 120 characters and choose valid watchlist and name filters.');
    const requestedSort=url.searchParams.get('sort');
    const requestedDirection=url.searchParams.get('direction');
-   const sortKeys:readonly string[]=['name','cost','profit','roi','score'];
-   if((requestedSort!==null&&!sortKeys.includes(requestedSort))||(requestedDirection!==null&&requestedDirection!=='asc'&&requestedDirection!=='desc'))fail(422,'INVALID_SORT','Choose a valid opportunity sort.','Sort by item name, buyout, potential profit, ROI or score, in ascending or descending order.');
+   const sortKeys:readonly string[]=opportunitySortKeys;
+   if((requestedSort!==null&&!sortKeys.includes(requestedSort))||(requestedDirection!==null&&requestedDirection!=='asc'&&requestedDirection!=='desc'))fail(422,'INVALID_SORT','Choose a valid opportunity sort.','Sort by item name, suggested action, cost, potential profit, ROI or score.');
    const key=(requestedSort??defaultOpportunitySort.key) as OpportunitySortKey;
    const sort:OpportunitySort={key,direction:(requestedDirection??(key==='name'?'asc':'desc')) as OpportunitySort['direction']};
    const bankroll=url.searchParams.has('bankroll')?Math.round(Number(url.searchParams.get('bankroll'))*10_000):userSettings.bankroll;
@@ -653,7 +660,7 @@ const server=createServer(async(request,response)=>{
    catch{fail(422,'INVALID_FILTERS','The bankroll or ROI filter is invalid.', 'Enter a positive bankroll and an ROI between 0% and 1000%.');}
    const snapshot=latest();
    const unsorted=snapshot?scanFor(configured,requestedStrategy):[];
-   const nameForId=(id:number)=>{const name=state.names[id];return name&&name!==`Item #${id}`?name:catalogName(id);};
+   const nameForId=knownItemName;
    const watched=watch==='1'?new Set(state.watch):undefined;
    const filtered=unsorted.filter(row=>{
     const name=nameForId(row.itemId);
@@ -752,7 +759,7 @@ const server=createServer(async(request,response)=>{
    requireMethod(method,'GET');
    const snapshot=latest();
    const rows=(!demo&&!provisional&&snapshot&&Date.now()-snapshot.at<7_200_000?scanFor(userSettings).filter(value=>value.confidence==='candidate'):[]).slice(0,20);
-   const code=`-- Generated advisory data. No game actions.\n${provisional?'-- Auction house mapping is unverified; no actionable entries.\n':''}AHCornerPlan = { market=${luaString(market)}, timestamp=${Math.floor((snapshot?.at||0)/1_000)}, rows={\n${rows.map(value=>`{id=${value.itemId}, name=${luaString(state.names[value.itemId]||`Item #${value.itemId}`)}, quantity=${value.quantity}, cost=${value.cost}, buyMax=${value.buyMax}, target=${value.target}},`).join('\n')}\n}}\n`;
+   const code=`-- Generated advisory data. No game actions.\n${provisional?'-- Auction house mapping is unverified; no actionable entries.\n':''}AHCornerPlan = { market=${luaString(market)}, timestamp=${Math.floor((snapshot?.at||0)/1_000)}, rows={\n${rows.map(value=>`{id=${value.itemId}, name=${luaString(knownItemName(value.itemId)||`Item #${value.itemId}`)}, quantity=${value.quantity}, cost=${value.cost}, buyMax=${value.buyMax}, target=${value.target}},`).join('\n')}\n}}\n`;
    response.writeHead(200,{'Content-Type':'text/plain; charset=utf-8','Content-Disposition':'attachment; filename="Plan.lua"','Cache-Control':'no-store','X-Content-Type-Options':'nosniff','Referrer-Policy':'no-referrer','X-Frame-Options':'DENY'});
    response.end(code);
    return;
