@@ -12,8 +12,10 @@ import type {Alert, CompactSnapshot, Opportunity, Settings} from './types.ts';
 import {Sessions} from './auth.ts';
 import {applyItemUse,itemUseFor,validateItemUse} from './item-use.ts';
 import {ItemNameResolver} from './item-names.ts';
+import {ItemMetadataResolver} from './item-metadata-resolver.ts';
 import {fetchRecipeIndex} from './recipe-index.ts';
-import type {RecipeUseMap} from './item-use.ts';
+import type {BlizzardItemMetadata,BlizzardItemMetadataMap,RecipeUseMap} from './item-use.ts';
+import type {ItemMetadata} from './blizzard.ts';
 import {defaultOpportunitySort,sortOpportunities} from './opportunity-sort.ts';
 import type {OpportunitySort,OpportunitySortKey} from './opportunity-sort.ts';
 
@@ -114,6 +116,12 @@ await store.prune();
 let state=await store.load();
 let settings=validSettings({...defaultSettings,...state.strategy});
 const liveDataRetentionMs=30*24*60*60*1_000;
+const missingMetadataRetryMs=24*60*60*1_000;
+function metadataFresh(record:BlizzardItemMetadata|undefined,now=Date.now()){
+ if(!record||record.source!=='blizzard-forever'||!Number.isFinite(record.checkedAt)||record.checkedAt>now||!Number.isFinite(record.updatedAt)||record.updatedAt<=0||record.updatedAt>record.checkedAt)return false;
+ const complete=Number.isSafeInteger(record.classId)&&Number(record.classId)>=0&&Number.isSafeInteger(record.subclassId)&&Number(record.subclassId)>=0;
+ return now-record.checkedAt<(complete?liveDataRetentionMs:missingMetadataRetryMs);
+}
 function expireLiveState(){
  if(demo)return false;
  const now=Date.now();
@@ -123,6 +131,11 @@ function expireLiveState(){
   delete state.nameSources;
   delete state.namesFetchedAt;
   changed=true;
+ }
+ if(state.blizzardMetadata){
+  const entries=Object.entries(state.blizzardMetadata);
+  const retained=entries.filter(([,value])=>metadataFresh(value,now));
+  if(retained.length!==entries.length){state.blizzardMetadata=Object.fromEntries(retained);changed=true;}
  }
  const alerts=state.alerts.filter(alert=>Number.isFinite(alert.at)&&alert.at<=now&&now-alert.at<liveDataRetentionMs);
  if(alerts.length!==state.alerts.length){state.alerts=alerts;changed=true;}
@@ -146,11 +159,14 @@ let lastChecked=0;
 let lastSuccess=0;
 let lastCollectionError:PublicProblem|undefined;
 let cached:Opportunity[]=[];
+let cachedBase:Opportunity[]=[];
 let cachedFresh:boolean|undefined;
-const strategyScans=new Map<string,Opportunity[]>();
+const strategyScans=new Map<string,{base:Opportunity[];rows:Opportunity[]}>();
 let saveQueue=Promise.resolve();
 let recipeBusy=false;
 let recipeError:string|null=null;
+let metadataError:string|null=null;
+let useRefreshTimer:ReturnType<typeof setTimeout>|undefined;
 const recipeAbort=new AbortController();
 
 function save(){
@@ -173,27 +189,75 @@ function saveUserStrategy(key:string,next:Settings){
 const nameResolver=new ItemNameResolver({
  lookup:id=>blizzard.nameDetails(id),
  isKnown:id=>!!state.names[id]&&state.names[id]!==`Item #${id}`,
- async onName(id,{name,source}){
+ async onName(id,{name,source,metadata}){
   state.namesFetchedAt??=Date.now();
   state.names[id]=name;
   (state.nameSources??={})[id]=source;
-  await save();
+  const previous=state.blizzardMetadata;
+  setMetadata(id,source==='forever'?metadata||null:null);
+  const updated=state.blizzardMetadata;
+  try{await save();}catch(error){if(state.blizzardMetadata===updated)state.blizzardMetadata=previous;throw error;}
+  scheduleUseRefresh();
+ }
+});
+
+function setMetadata(id:number,metadata:ItemMetadata|null){
+ const now=Date.now();
+ const classId=metadata?.itemClassId??null,subclassId=metadata?.itemSubclassId??null;
+ const old=state.blizzardMetadata?.[id];
+ const updatedAt=old&&old.source==='blizzard-forever'&&old.classId===classId&&old.subclassId===subclassId&&Number.isFinite(old.updatedAt)&&old.updatedAt>0&&old.updatedAt<=now?old.updatedAt:now;
+ const updated:BlizzardItemMetadataMap={...state.blizzardMetadata,[id]:{source:'blizzard-forever',checkedAt:now,updatedAt,classId,subclassId}};
+ // Bound the cache on long-running large markets. The oldest records can be
+ // fetched again if needed; negative results have a shorter lifetime.
+ const keys=Object.keys(updated);
+ if(keys.length>10_000){const oldest=keys.reduce((a,b)=>updated[a].checkedAt<=updated[b].checkedAt?a:b);delete updated[oldest];}
+ state.blizzardMetadata=updated;
+}
+
+const metadataResolver=new ItemMetadataResolver({
+ lookup:async id=>(await blizzard.foreverItemDetails(id))?.metadata??null,
+ onError:()=>{metadataError='Some item categories could not be checked. Saved categories remain available; the app will retry.';},
+ shouldLookup:id=>{
+  const name=state.names[id];
+  return !!name&&name!==`Item #${id}`&&!itemUseFor(state.itemUses||{},id)&&!metadataFresh(state.blizzardMetadata?.[id]);
+ },
+ async onResult(id,metadata){
+  const previous=state.blizzardMetadata;
+  setMetadata(id,metadata);
+  const updated=state.blizzardMetadata;
+  try{await save();}catch(error){if(state.blizzardMetadata===updated)state.blizzardMetadata=previous;throw error;}
+  metadataError=null;
+  scheduleUseRefresh();
  }
 });
 
 function latest(){return snapshots.at(-1);}
 
-function marketScan(snapshot:NonNullable<ReturnType<typeof latest>>,configured:Settings){
- const rows=applyItemUse(scan(snapshot,snapshots,configured),state.itemUses||{},state.recipeUses||{});
+function decorateScan(base:Opportunity[]){
+ const rows=applyItemUse(base,state.itemUses||{},state.recipeUses||{},state.blizzardMetadata||{});
  return provisional?rows.map(row=>({...row,confidence:'watch' as const,reasons:['Auction house mapping is unverified; compare in-game prices before acting.',...row.reasons]})):rows;
+}
+
+function refreshUseViews(){
+ if(useRefreshTimer)clearTimeout(useRefreshTimer);
+ useRefreshTimer=undefined;
+ cached=decorateScan(cachedBase);
+ for(const entry of strategyScans.values())entry.rows=decorateScan(entry.base);
+}
+
+function scheduleUseRefresh(){
+ if(useRefreshTimer)return;
+ useRefreshTimer=setTimeout(refreshUseViews,1_000);
+ useRefreshTimer.unref();
 }
 
 function refresh(){
  strategyScans.clear();
  const snapshot=latest();
  cachedFresh=snapshot? snapshot.source==='demo'||Date.now()-snapshot.at<=2*3_600_000:undefined;
- cached=snapshot?marketScan(snapshot,settings):[];
- if(!demo)nameResolver.enqueue([...cached.slice(0,100).map(row=>row.itemId),...state.watch]);
+ cachedBase=snapshot?scan(snapshot,snapshots,settings):[];
+ cached=decorateScan(cachedBase);
+ if(!demo){const ids=[...cached.slice(0,100).map(row=>row.itemId),...state.watch];nameResolver.enqueue(ids);metadataResolver.enqueue(ids);}
 }
 
 function scanFor(configured:Settings){
@@ -202,9 +266,10 @@ function scanFor(configured:Settings){
  const key=JSON.stringify(configured);
  if(key===JSON.stringify(settings))return cached;
  const found=strategyScans.get(key);
- if(found){strategyScans.delete(key);strategyScans.set(key,found);return found;}
- const rows=marketScan(snapshot,configured);
- strategyScans.set(key,rows);
+ if(found){strategyScans.delete(key);strategyScans.set(key,found);return found.rows;}
+ const base=scan(snapshot,snapshots,configured);
+ const rows=decorateScan(base);
+ strategyScans.set(key,{base,rows});
  if(strategyScans.size>4)strategyScans.delete(strategyScans.keys().next().value!);
  return rows;
 }
@@ -280,7 +345,7 @@ async function collect(){
  try{
   expireInMemorySnapshots();
   await store.prune();
-  if(expireLiveState())await save();
+  if(expireLiveState()){await save();refreshUseViews();}
   if(demo){
    if(!snapshots.length||Date.now()-(latest()?.at||0)>=3_600_000){
     for(const snapshot of demoSnapshots())await store.put(snapshot);
@@ -437,13 +502,15 @@ const server=createServer(async(request,response)=>{
   // workspaces. Only the server-side Mocker exchange may supply these values.
   const userKey=identity?createHash('sha256').update(JSON.stringify([identity.teamId,identity.userId])).digest('hex'):null;
   const userSettings=userKey&&state.userStrategies?.[userKey]?validSettings({...defaultSettings,...state.userStrategies[userKey]}):settings;
-  if(path.startsWith('/api/'))expireInMemorySnapshots();
+  if(path.startsWith('/api/')){
+   expireInMemorySnapshots();
+   if(expireLiveState()){await save();refreshUseViews();}
+  }
   if(path==='/api/status'){
    requireMethod(method,'GET');
-   if(expireLiveState())await save();
-   if(!demo)nameResolver.enqueue([...state.watch,...state.trades.map(trade=>trade.itemId),...state.alerts.map(alert=>alert.itemId)]);
+   if(!demo){const ids=[...state.watch,...state.trades.map(trade=>trade.itemId),...state.alerts.map(alert=>alert.itemId)];nameResolver.enqueue(ids);metadataResolver.enqueue(ids);}
    const snapshot=latest();
-   json(response,{mode,market,houseVerified,at:snapshot?.at||null,listingCount:snapshot?.listingCount||0,snapshots:snapshots.length,collector:{busy,lastChecked,lastSuccess,lastError:lastCollectionError||null,nextScheduledAt:collectSchedule==='interval'&&lastChecked?lastChecked+pollMinutes*60_000:null},settings:userSettings,watch:state.watch,names:state.names,nameSources:state.nameSources||{},itemUses:state.itemUses||{},recipeUses:state.recipeUses||{},recipeIndex:state.recipeIndex||null,recipeLookup:{busy:recipeBusy,error:recipeError},stale:!snapshot||Date.now()-snapshot.at>7_200_000});
+   json(response,{mode,market,houseVerified,at:snapshot?.at||null,listingCount:snapshot?.listingCount||0,snapshots:snapshots.length,collector:{busy,lastChecked,lastSuccess,lastError:lastCollectionError||null,nextScheduledAt:collectSchedule==='interval'&&lastChecked?lastChecked+pollMinutes*60_000:null},settings:userSettings,watch:state.watch,names:state.names,nameSources:state.nameSources||{},itemUses:state.itemUses||{},recipeUses:state.recipeUses||{},blizzardMetadata:state.blizzardMetadata||{},metadataError,recipeIndex:state.recipeIndex||null,recipeLookup:{busy:recipeBusy,error:recipeError},stale:!snapshot||Date.now()-snapshot.at>7_200_000});
    return;
   }
   if(path==='/api/settings'){
@@ -500,7 +567,7 @@ const server=createServer(async(request,response)=>{
    const snapshot=latest();
    const unsorted=snapshot?scanFor(configured):[];
    const rows=sortOpportunities(unsorted,sort,id=>{const name=state.names[id];return name&&name!==`Item #${id}`?name:`Item #${id}`;});
-   if(!demo)nameResolver.enqueue(rows.slice(0,100).map(row=>row.itemId));
+   if(!demo){const ids=rows.slice(0,100).map(row=>row.itemId);nameResolver.enqueue(ids);metadataResolver.enqueue(ids);}
    json(response,{rows:rows.slice(0,100),mode,at:snapshot?.at});
    return;
   }
@@ -513,13 +580,12 @@ const server=createServer(async(request,response)=>{
   }
   if(path==='/api/backtest'){
    requireMethod(method,'GET');
-   json(response,provisional?[]:backtest(snapshots,userSettings).filter(result=>{const evidence=itemUseFor(state.itemUses||{},result.itemId,state.recipeUses||{});return !!evidence&&evidence.kind!=='exclude'&&evidence.updatedAt<=result.at;}));
+   json(response,provisional?[]:backtest(snapshots,userSettings).filter(result=>{const evidence=itemUseFor(state.itemUses||{},result.itemId,state.recipeUses||{},state.blizzardMetadata||{});return !!evidence&&evidence.kind!=='exclude'&&evidence.updatedAt<=result.at;}));
    return;
   }
   if(path==='/api/alerts'){
    requireMethod(method,'GET');
-   if(expireLiveState())await save();
-   json(response,provisional?[]:state.alerts.filter(alert=>{const evidence=itemUseFor(state.itemUses||{},alert.itemId,state.recipeUses||{});return !!evidence&&evidence.kind!=='exclude'&&evidence.updatedAt<=alert.at;}));
+   json(response,provisional?[]:state.alerts.filter(alert=>{const evidence=itemUseFor(state.itemUses||{},alert.itemId,state.recipeUses||{},state.blizzardMetadata||{});return !!evidence&&evidence.kind!=='exclude'&&evidence.updatedAt<=alert.at;}));
    return;
   }
   if(path==='/api/portfolio'){
@@ -612,6 +678,8 @@ function shutdown(){
  clearTimeout(recipeStart);
  recipeAbort.abort();
  nameResolver.close();
+ metadataResolver.close();
+ if(useRefreshTimer)clearTimeout(useRefreshTimer);
  server.close(()=>void store.close());
 }
 

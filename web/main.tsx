@@ -1,7 +1,7 @@
 import React,{useEffect,useRef,useState} from 'react';
 import {createRoot} from 'react-dom/client';
 import type {Alert,Opportunity,Settings,Stats,Trade} from '../src/types.ts';
-import type {ItemUseKind,ItemUseMap,RecipeUseMap} from '../src/item-use.ts';
+import type {BlizzardItemMetadataMap,ItemUseKind,ItemUseMap,RecipeUseMap} from '../src/item-use.ts';
 import {itemUseFor} from '../src/item-use.ts';
 import type {ItemNameDetails} from '../src/blizzard.ts';
 import {formatMoney as money,opportunityInsights} from '../src/insights.ts';
@@ -77,7 +77,7 @@ function HistoryChart({history,loading}:{history:Stats[];loading:boolean}){
 }
 
 type Collector={busy:boolean;lastChecked:number;lastSuccess:number;lastError:PublicProblem|null;nextScheduledAt:number|null};
-type Status={mode:string;market:string;houseVerified:boolean;at:number|null;listingCount:number;snapshots:number;collector:Collector;settings:Settings;watch:number[];names:Record<number,string>;nameSources:Record<number,ItemNameDetails['source']>;itemUses:ItemUseMap;recipeUses:RecipeUseMap;recipeIndex:{dataset:string;build:string;fetchedAt:number}|null;recipeLookup:{busy:boolean;error:string|null};stale:boolean};
+type Status={mode:string;market:string;houseVerified:boolean;at:number|null;listingCount:number;snapshots:number;collector:Collector;settings:Settings;watch:number[];names:Record<number,string>;nameSources:Record<number,ItemNameDetails['source']>;itemUses:ItemUseMap;recipeUses:RecipeUseMap;blizzardMetadata:BlizzardItemMetadataMap;metadataError:string|null;recipeIndex:{dataset:string;build:string;fetchedAt:number}|null;recipeLookup:{busy:boolean;error:string|null};stale:boolean};
 type Position={itemId:number;quantity:number;basis:number;realized:number;unmatched:number};
 type Backtest={at:number;itemId:number;target:number;cost:number;potentialProfit:number;competingUnits:number;held:boolean};
 
@@ -113,7 +113,12 @@ function App({onLogout}:{onLogout?:()=>void}){
  const [form,setForm]=useState({side:'buy',itemId:'',quantity:'',total:'',fee:'0'});
  const resolvedName=(itemId:number)=>{const value=status?.names[itemId];return value&&value!==`Item #${itemId}`?value:undefined;};
  const name=(itemId:number)=>resolvedName(itemId)||`Item #${itemId} (name unavailable)`;
- const use=(itemId:number)=>itemUseFor(status?.itemUses||{},itemId,status?.recipeUses||{});
+ const use=(itemId:number)=>itemUseFor(status?.itemUses||{},itemId,status?.recipeUses||{},status?.blizzardMetadata||{});
+ const consumableUse=(itemId:number)=>itemUseFor({},itemId,{},status?.blizzardMetadata||{});
+ const useLabel=(itemId:number)=>{
+  const primary=use(itemId),secondary=consumableUse(itemId);
+  return primary?.source==='warcraftforever-recipe'&&secondary?`${primary.kind} · ${secondary.kind}`:primary?.kind||'use unknown';
+ };
  const filtered=sortOpportunities(rows.filter(row=>(showUnnamed||!!resolvedName(row.itemId))&&(!onlyWatch||status?.watch.includes(row.itemId))&&name(row.itemId).toLowerCase().includes(query.toLowerCase())),sort,name);
  const active=filtered.find(row=>row.itemId===id)||filtered[0];
  const changeSort=(key:OpportunitySortKey)=>{
@@ -192,6 +197,7 @@ function App({onLogout}:{onLogout?:()=>void}){
  const provisional=status?.mode==='live'&&!status.houseVerified;
  const insights=active&&status?opportunityInsights(active,status.settings):undefined;
  const activeUse=active?use(active.itemId):undefined;
+ const activeConsumable=active?consumableUse(active.itemId):undefined;
 
  return <>
   <header>
@@ -236,7 +242,8 @@ function App({onLogout}:{onLogout?:()=>void}){
     </section>
     <details className="panel">
      <summary>Record item-use research</summary>
-     <p className="muted">Recipe uses are supplied by <a href="https://warcraftforever.com/developers/data/" target="_blank" rel="noopener noreferrer">Warcraft Forever</a>. Unresearched items are watch-only. Your research overrides automatic evidence; choose Unknown to clear your override. Excluded items are hidden.</p>
+     <p className="muted">Uses come from cached Blizzard item categories and <a href="https://warcraftforever.com/developers/data/" target="_blank" rel="noopener noreferrer">Warcraft Forever recipe data</a>. Missing categories are checked gradually in the background; items without evidence stay watch-only. Your research overrides automatic evidence; choose Unknown to clear your override. Excluded items are hidden.</p>
+     {status?.metadataError&&<p className="muted">{status.metadataError}</p>}
      {status?.mode==='live'&&status.recipeLookup?.error&&<p className="muted">{status.recipeLookup.error}</p>}
      {!status?.recipeIndex&&status?.mode==='live'&&!status.recipeLookup?.error&&<p className="muted">Loading the recipe index; items without research remain watch-only.</p>}
      {status?.recipeIndex&&<p className="muted">Recipe data: Forever build {status.recipeIndex.build}, checked {new Date(status.recipeIndex.fetchedAt).toLocaleString()}. A recipe relationship does not prove demand or sales.</p>}
@@ -250,7 +257,7 @@ function App({onLogout}:{onLogout?:()=>void}){
     <div className="split">
      <section className="panel">
       <div className="queue-heading"><div><h3>Opportunity queue <span>{filtered.length}</span></h3><p className="metric-explainer">Select a column heading to sort; search and watchlist filters apply to the first 100 results. Profit assumes every purchased unit sells at the target.</p></div></div>
-      <div className="scroll"><table><thead><tr><SortHeader label="Item / confidence" column="name" sort={sort} onSort={changeSort}/><SortHeader label="Buyout" column="cost" sort={sort} onSort={changeSort}/><SortHeader label="Potential profit" column="profit" sort={sort} onSort={changeSort}/><SortHeader label="ROI" column="roi" sort={sort} onSort={changeSort}/><SortHeader label="Score" column="score" sort={sort} onSort={changeSort}/></tr></thead><tbody>{filtered.map(row=><tr key={row.itemId} onClick={()=>selectOpportunity(row.itemId)} className={active?.itemId===row.itemId?'chosen':''}><td><ItemLink id={row.itemId} name={name(row.itemId)} source={status?.nameSources?.[row.itemId]}/> <button className="link" onClick={event=>{event.stopPropagation();selectOpportunity(row.itemId);}} aria-label={`View details for ${name(row.itemId)}`}>Details</button><small className={row.confidence==='candidate'?'green':'muted'}>{row.confidence} · {use(row.itemId)?.kind||'use unknown'}</small></td><td>{money(row.cost)}</td><td className="green">+{money(row.profit)}</td><td>{pct(row.roi)}</td><td>{row.score}</td></tr>)}</tbody></table>{!filtered.length&&<p className="empty">No named opportunities match your filters yet. Names may still be loading; use “Include items without names” to inspect missing names.</p>}</div>
+      <div className="scroll"><table><thead><tr><SortHeader label="Item / confidence" column="name" sort={sort} onSort={changeSort}/><SortHeader label="Buyout" column="cost" sort={sort} onSort={changeSort}/><SortHeader label="Potential profit" column="profit" sort={sort} onSort={changeSort}/><SortHeader label="ROI" column="roi" sort={sort} onSort={changeSort}/><SortHeader label="Score" column="score" sort={sort} onSort={changeSort}/></tr></thead><tbody>{filtered.map(row=><tr key={row.itemId} onClick={()=>selectOpportunity(row.itemId)} className={active?.itemId===row.itemId?'chosen':''}><td><ItemLink id={row.itemId} name={name(row.itemId)} source={status?.nameSources?.[row.itemId]}/> <button className="link" onClick={event=>{event.stopPropagation();selectOpportunity(row.itemId);}} aria-label={`View details for ${name(row.itemId)}`}>Details</button><small className={row.confidence==='candidate'?'green':'muted'}>{row.confidence} · {useLabel(row.itemId)}</small></td><td>{money(row.cost)}</td><td className="green">+{money(row.profit)}</td><td>{pct(row.roi)}</td><td>{row.score}</td></tr>)}</tbody></table>{!filtered.length&&<p className="empty">No named opportunities match your filters yet. Names may still be loading; use “Include items without names” to inspect missing names.</p>}</div>
      </section>
      <section className="panel detail" ref={detailRef}>
       {active&&insights&&status?<>
@@ -277,7 +284,7 @@ function App({onLogout}:{onLogout?:()=>void}){
         <h4>Why this is {active.confidence==='candidate'?'a candidate':'watch only'}</h4>
         <ul className="check-list">
          <li className={`check-row ${provisional?'warning':'pass'}`}><span className="check-icon" aria-hidden="true">{provisional?'!':'✓'}</span><div className="check-copy"><strong>Auction house · {provisional?'unverified':status.mode==='demo'?'demo':'verified'}</strong><small>{provisional?'Compare prices with your in-game US PvP Horde auction house before relying on this market.':status.mode==='demo'?'Synthetic data for testing only.':'The selected auction house has been marked verified.'}</small></div></li>
-         <li className={`check-row ${activeUse?'pass':'unknown'}`}><span className="check-icon" aria-hidden="true">{activeUse?'✓':'?'}</span><div className="check-copy"><strong>Item use · {activeUse?activeUse.kind:'unknown'}</strong><small>{activeUse?`${activeUse.source==='player'?'Player research':'Recipe evidence'}: ${activeUse.note}. A use does not prove demand or sales.`:'No quest, recipe or other use has been recorded. Research the item before trading.'}</small>{activeUse?.source==='warcraftforever-recipe'&&<a href={`https://warcraftforever.com/spells/${activeUse.recipeId}`} target="_blank" rel="noopener noreferrer">View source recipe</a>}</div></li>
+         <li className={`check-row ${activeUse?'pass':'unknown'}`}><span className="check-icon" aria-hidden="true">{activeUse?'✓':'?'}</span><div className="check-copy"><strong>Item use · {activeUse?activeUse.kind:'unknown'}</strong><small>{activeUse?`${activeUse.source==='player'?'Player research':activeUse.source==='blizzard-forever'?'Blizzard Forever item data':'Recipe evidence'}: ${activeUse.note}. A use does not prove demand or sales.`:'No use is known yet; the item category may still be loading. Research it before trading.'}</small>{activeUse?.source==='warcraftforever-recipe'&&activeConsumable&&<small>Blizzard Forever item data also identifies this as {activeConsumable.note.toLowerCase()}.</small>}{activeUse?.source==='warcraftforever-recipe'&&<a href={`https://warcraftforever.com/spells/${activeUse.recipeId}`} target="_blank" rel="noopener noreferrer">View source recipe</a>}</div></li>
          {insights.checks.map(check=><li className={`check-row ${check.status==='caution'?'warning':check.status}`} key={check.key}><span className="check-icon" aria-hidden="true">{check.status==='pass'?'✓':check.status==='caution'?'!':'?'}</span><div className="check-copy"><strong>{check.label} · {check.status==='pass'?'meets model check':check.status==='caution'?'needs attention':'not enough data'}</strong><small>{check.detail}</small></div></li>)}
         </ul>
         <p className="metric-explainer">Score {active.score}/100 is a ranking heuristic, not a probability or an estimate of sales. Removed listings may have sold, expired, or been cancelled.</p>

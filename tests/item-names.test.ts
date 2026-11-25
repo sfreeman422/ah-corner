@@ -97,3 +97,17 @@ test('persists a Classic fallback with its source',async()=>{
   assert.deepEqual(saved,{name:'Advisor’s Pack',source:'classic-progression'});
  }finally{resolver.close();}
 });
+
+test('passes Forever metadata along with a resolved name',async()=>{
+ let saved:ItemNameDetails|undefined;
+ const resolver=new ItemNameResolver({
+  isKnown:()=>!!saved,
+  async lookup(){return {name:'Tough Jerky',source:'forever',metadata:{itemClassId:0,itemSubclassId:5}};},
+  onName(_id,result){saved=result;}
+ });
+ try{
+  resolver.enqueue([117]);
+  await waitFor(()=>!!saved);
+  assert.deepEqual(saved,{name:'Tough Jerky',source:'forever',metadata:{itemClassId:0,itemSubclassId:5}});
+ }finally{resolver.close();}
+});

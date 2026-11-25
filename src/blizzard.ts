@@ -1,8 +1,11 @@
 import {createHash} from 'node:crypto';
 import {normalize} from './engine.ts';import type {Snapshot} from './types.ts';
-export type ItemNameDetails={name:string;source:'forever'|'classic-era'|'classic-progression'};
+export type ItemMetadata={itemClassId:number;itemSubclassId:number};
+export type ItemNameDetails={name:string;source:'forever'|'classic-era'|'classic-progression';metadata?:ItemMetadata};
+type ForeverItemDetails={name:string;metadata:ItemMetadata|null};
 export class Blizzard{
  region=process.env.REGION||'us';ruleset=Number(process.env.RULESET_ID||1);private token='';private expires=0;
+ private itemRequests=new Map<number,Promise<ForeverItemDetails|null>>();
  constructor(){if(!['us','eu','kr','tw'].includes(this.region)||!Number.isSafeInteger(this.ruleset)||this.ruleset<=0)throw Error('Invalid region/ruleset');}
  private async auth(){if(this.token&&Date.now()<this.expires)return this.token;const id=process.env.BLIZZARD_CLIENT_ID,secret=process.env.BLIZZARD_CLIENT_SECRET;if(!id||!secret)throw Error('Set Blizzard credentials in .env (never paste them in chat)');const r=await fetch('https://oauth.battle.net/token',{method:'POST',headers:{Authorization:'Basic '+Buffer.from(`${id}:${secret}`).toString('base64'),'Content-Type':'application/x-www-form-urlencoded'},body:'grant_type=client_credentials',signal:AbortSignal.timeout(30000)});if(!r.ok)throw Error(`Blizzard OAuth HTTP ${r.status}`);const b=await r.json();if(typeof b.access_token!=='string')throw Error('Invalid OAuth response');this.token=b.access_token;this.expires=Date.now()+Math.max(0,Number(b.expires_in||3600)-60)*1000;return this.token;}
  private async request(path:string,namespace:string,modified?:string):Promise<Response>{const url=new URL(`https://${this.region}.api.blizzard.com${path}`);url.searchParams.set('namespace',namespace);url.searchParams.set('locale','en_US');for(let i=0;i<3;i++){const h:Record<string,string>={Authorization:`Bearer ${await this.auth()}`};if(modified)h['If-Modified-Since']=modified;const r=await fetch(url,{headers:h,signal:AbortSignal.timeout(90000)});if(r.status===401&&i===0){this.token='';continue;}if((r.status===429||r.status>=500)&&i<2){await new Promise(resolve=>setTimeout(resolve,Math.min(30000,Math.max(1000,Number(r.headers.get('retry-after')||0)*1000,2000*2**i))));continue;}return r;}throw Error('Blizzard request retries exhausted');}
@@ -13,11 +16,32 @@ export class Blizzard{
  async snapshot(house:number,_modified?:string):Promise<{snapshot:Snapshot|null;modified?:string}>{if(!Number.isSafeInteger(house)||house<1)throw Error('Invalid HOUSE_ID');const path=`/data/wow/ruleset/${this.ruleset}/auctions/${house}`;const r=await this.get(path,'dynamic');if(!r.ok)throw Error(`House HTTP ${r.status}`);const b=await r.json();if(b.id!==house||!Array.isArray(b.auctions))throw Error('House mismatch or missing regular auctions');let c=b.commodities; // Some deployments omit embedded commodities or return a linked object.
  if(!Array.isArray(c)){if(Array.isArray(c?.auctions))c=c.auctions;else{const cr=await this.get(path+'/commodities');if(!cr.ok)throw Error(`Commodity HTTP ${cr.status}; rejecting partial book`);c=(await cr.json()).auctions;}}
  if(!Array.isArray(c))throw Error('Missing commodity array; refusing incomplete snapshot');const listings=[...normalize(b.auctions,'auction'),...normalize(c,'commodity')];if(!listings.length)throw Error('Empty priced book');const hash=createHash('sha256');for(const l of [...listings].sort((a,b)=>a.id.localeCompare(b.id)))hash.update(`${l.id}:${l.itemId}:${l.quantity}:${l.total}:${l.timeLeft};`);const lm=r.headers.get('last-modified')||undefined;const at=Date.now();return {snapshot:{key:`${this.region}:${house}:${hash.digest('hex')}`,at,source:'blizzard',market:`${this.region}:${this.ruleset}:${house}`,listings},modified:lm};}
- async nameDetails(id:number):Promise<ItemNameDetails|null>{
+ async foreverItemDetails(id:number):Promise<ForeverItemDetails|null>{
   if(!Number.isSafeInteger(id)||id<1)throw Error('Invalid item ID');
+  const existing=this.itemRequests.get(id);
+  if(existing)return existing;
+  const pending=this.fetchForeverItemDetails(id);
+  this.itemRequests.set(id,pending);
+  try{return await pending;}
+  finally{if(this.itemRequests.get(id)===pending)this.itemRequests.delete(id);}
+ }
+ private async fetchForeverItemDetails(id:number):Promise<ForeverItemDetails|null>{
+  const r=await this.get(`/data/wow/item/${id}`,'static');
+  if(r.status===404)return null;
+  if(!r.ok)throw Error(`Item HTTP ${r.status} (forever)`);
+  const b=await r.json();
+  const name=typeof b.name==='string'?b.name:b.name?.en_US;
+  if(typeof name!=='string'||!name.trim())throw Error('Item name missing (forever)');
+  const itemClassId=b.item_class?.id,itemSubclassId=b.item_subclass?.id;
+  const validId=(value:unknown):value is number=>typeof value==='number'&&Number.isSafeInteger(value)&&value>=0;
+  const metadata=validId(itemClassId)&&validId(itemSubclassId)?{itemClassId,itemSubclassId}:null;
+  return {name,metadata};
+ }
+ async nameDetails(id:number):Promise<ItemNameDetails|null>{
+  const forever=await this.foreverItemDetails(id);
+  if(forever)return {name:forever.name,source:'forever',...(forever.metadata?{metadata:forever.metadata}:{})};
   const path=`/data/wow/item/${id}`;
   const lookups:[ItemNameDetails['source'],()=>Promise<Response>][]=[
-   ['forever',()=>this.get(path,'static')],
    ['classic-era',()=>this.request(path,`static-classic1x-${this.region}`)],
    ['classic-progression',()=>this.request(path,`static-classic-${this.region}`)]
   ];

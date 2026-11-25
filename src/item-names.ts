@@ -73,7 +73,7 @@ export class ItemNameResolver{
    const name=typeof raw?.name==='string'?raw.name.trim():'';
    if(!name||name===`Item #${id}`){this.defer(id,this.options.missingTtlMs);return;}
    // Another source may have resolved this item while the lookup was in flight.
-   if(!this.options.isKnown(id))await this.options.onName(id,{name,source:raw!.source});
+   if(!this.options.isKnown(id))await this.options.onName(id,{...raw!,name});
   }catch{
    if(!this.closed)this.defer(id,this.options.retryTtlMs);
   }finally{

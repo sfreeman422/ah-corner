@@ -83,7 +83,7 @@ test('item names prefer Forever and fall back to Classic namespaces only on 404'
   assert.deepEqual(await client.nameDetails(2589),{name:'Forever Linen',source:'forever'});
   assert.deepEqual(requests.splice(0),['static-forever-us']);
 
-  responses={'static-forever-us':missing(),'static-classic1x-us':Response.json({name:{en_US:'Era Linen'}})};
+  responses={'static-forever-us':missing(),'static-classic1x-us':Response.json({name:{en_US:'Era Linen'},item_class:{id:0},item_subclass:{id:5}})};
   assert.deepEqual(await client.nameDetails(2589),{name:'Era Linen',source:'classic-era'});
   assert.deepEqual(requests.splice(0),['static-forever-us','static-classic1x-us']);
 
@@ -119,5 +119,72 @@ test('item names prefer Forever and fall back to Classic namespaces only on 404'
   if(oldId===undefined)delete process.env.BLIZZARD_CLIENT_ID;else process.env.BLIZZARD_CLIENT_ID=oldId;
   if(oldSecret===undefined)delete process.env.BLIZZARD_CLIENT_SECRET;else process.env.BLIZZARD_CLIENT_SECRET=oldSecret;
   if(oldRegion===undefined)delete process.env.REGION;else process.env.REGION=oldRegion;
+ }
+});
+
+test('Forever item metadata is returned with names and fetched without Classic fallbacks',async()=>{
+ const previous=globalThis.fetch;
+ const oldId=process.env.BLIZZARD_CLIENT_ID,oldSecret=process.env.BLIZZARD_CLIENT_SECRET,oldRegion=process.env.REGION;
+ process.env.BLIZZARD_CLIENT_ID='mock';process.env.BLIZZARD_CLIENT_SECRET='mock';process.env.REGION='us';
+ let item:Response=Response.json({name:'Tough Jerky',item_class:{id:0},item_subclass:{id:5}});
+ const requests:string[]=[];
+ try{
+  globalThis.fetch=async(input)=>{
+   const url=new URL(String(input));
+   if(url.hostname==='oauth.battle.net')return Response.json({access_token:'test',expires_in:3600});
+   requests.push(url.searchParams.get('namespace')!);
+   return item.clone();
+  };
+  const client=new Blizzard();
+  assert.deepEqual(await client.foreverItemDetails(117),{name:'Tough Jerky',metadata:{itemClassId:0,itemSubclassId:5}});
+  assert.deepEqual(await client.nameDetails(117),{name:'Tough Jerky',source:'forever',metadata:{itemClassId:0,itemSubclassId:5}});
+  assert.deepEqual(requests.splice(0),['static-forever-us','static-forever-us']);
+
+  item=Response.json({name:'Unknown class',item_class:{id:0},item_subclass:{id:-1}});
+  assert.deepEqual(await client.foreverItemDetails(999),{name:'Unknown class',metadata:null});
+  item=Response.json({name:'Unknown class',item_class:{id:'0'},item_subclass:{id:5}});
+  assert.deepEqual(await client.foreverItemDetails(999),{name:'Unknown class',metadata:null});
+  item=new Response(null,{status:404});
+  assert.equal(await client.foreverItemDetails(999),null);
+  assert.deepEqual(requests.splice(0),['static-forever-us','static-forever-us','static-forever-us']);
+  item=new Response(null,{status:403});
+  await assert.rejects(()=>client.foreverItemDetails(999),/Item HTTP 403 \(forever\)/);
+  assert.deepEqual(requests,['static-forever-us']);
+ }finally{
+  globalThis.fetch=previous;
+  if(oldId===undefined)delete process.env.BLIZZARD_CLIENT_ID;else process.env.BLIZZARD_CLIENT_ID=oldId;
+  if(oldSecret===undefined)delete process.env.BLIZZARD_CLIENT_SECRET;else process.env.BLIZZARD_CLIENT_SECRET=oldSecret;
+  if(oldRegion===undefined)delete process.env.REGION;else process.env.REGION=oldRegion;
+ }
+});
+
+test('concurrent name and metadata requests share one Forever fetch and clear it afterwards',async()=>{
+ const previous=globalThis.fetch;
+ const oldId=process.env.BLIZZARD_CLIENT_ID,oldSecret=process.env.BLIZZARD_CLIENT_SECRET;
+ process.env.BLIZZARD_CLIENT_ID='mock';process.env.BLIZZARD_CLIENT_SECRET='mock';
+ let itemRequests=0,release:()=>void=()=>{};
+ const gate=new Promise<void>(resolve=>{release=resolve;});
+ try{
+  globalThis.fetch=async(input)=>{
+   const url=new URL(String(input));
+   if(url.hostname==='oauth.battle.net')return Response.json({access_token:'test',expires_in:3600});
+   itemRequests++;
+   await gate;
+   return Response.json({name:'Tough Jerky',item_class:{id:0},item_subclass:{id:5}});
+  };
+  const client=new Blizzard();
+  const metadata=client.foreverItemDetails(117);
+  const name=client.nameDetails(117);
+  release();
+  const [found,named]=await Promise.all([metadata,name]);
+  assert.equal(itemRequests,1);
+  assert.deepEqual(found?.metadata,{itemClassId:0,itemSubclassId:5});
+  assert.deepEqual(named?.metadata,found?.metadata);
+  await client.foreverItemDetails(117);
+  assert.equal(itemRequests,2,'the completed request is not a permanent in-memory cache');
+ }finally{
+  globalThis.fetch=previous;
+  if(oldId===undefined)delete process.env.BLIZZARD_CLIENT_ID;else process.env.BLIZZARD_CLIENT_ID=oldId;
+  if(oldSecret===undefined)delete process.env.BLIZZARD_CLIENT_SECRET;else process.env.BLIZZARD_CLIENT_SECRET=oldSecret;
  }
 });
