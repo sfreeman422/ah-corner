@@ -10,7 +10,8 @@ import {parseJournal, validateTrade} from './journal.ts';
 import {openStore} from './store.ts';
 import type {Alert, CompactSnapshot, Opportunity, Settings} from './types.ts';
 import {Sessions} from './auth.ts';
-import {applyItemUse,itemUseFor,validateItemUse} from './item-use.ts';
+import {applyItemUse,itemCategoryFor,itemUseFor,validateItemUse} from './item-use.ts';
+import {fetchForeverItems} from './forever-item-catalog.ts';
 import {ItemNameResolver} from './item-names.ts';
 import {ItemMetadataResolver} from './item-metadata-resolver.ts';
 import {fetchRecipeIndex} from './recipe-index.ts';
@@ -165,6 +166,9 @@ const strategyScans=new Map<string,{base:Opportunity[];rows:Opportunity[]}>();
 let saveQueue=Promise.resolve();
 let recipeBusy=false;
 let recipeError:string|null=null;
+let catalogBusy=false;
+let catalogError:string|null=null;
+let catalogTimer:ReturnType<typeof setTimeout>|undefined;
 let metadataError:string|null=null;
 let useRefreshTimer:ReturnType<typeof setTimeout>|undefined;
 const recipeAbort=new AbortController();
@@ -188,7 +192,7 @@ function saveUserStrategy(key:string,next:Settings){
 
 const nameResolver=new ItemNameResolver({
  lookup:id=>blizzard.nameDetails(id),
- isKnown:id=>!!state.names[id]&&state.names[id]!==`Item #${id}`,
+ isKnown:id=>!!catalogName(id)||!!state.names[id]&&state.names[id]!==`Item #${id}`,
  async onName(id,{name,source,metadata}){
   state.namesFetchedAt??=Date.now();
   state.names[id]=name;
@@ -219,7 +223,7 @@ const metadataResolver=new ItemMetadataResolver({
  onError:()=>{metadataError='Some item categories could not be checked. Saved categories remain available; the app will retry.';},
  shouldLookup:id=>{
   const name=state.names[id];
-  return !!name&&name!==`Item #${id}`&&!itemUseFor(state.itemUses||{},id)&&!metadataFresh(state.blizzardMetadata?.[id]);
+  return !!name&&name!==`Item #${id}`&&!itemUseFor(state.itemUses||{},id)&&!itemCategoryFor(id,state.blizzardMetadata||{},state.itemCatalog)&&!metadataFresh(state.blizzardMetadata?.[id]);
  },
  async onResult(id,metadata){
   const previous=state.blizzardMetadata;
@@ -233,8 +237,13 @@ const metadataResolver=new ItemMetadataResolver({
 
 function latest(){return snapshots.at(-1);}
 
+function catalogName(id:number){
+ const item=state.itemCatalog?.items?.[String(id)];
+ return itemCategoryFor(id,{},state.itemCatalog)&&typeof item?.name==='string'&&item.name.trim()?item.name:undefined;
+}
+
 function decorateScan(base:Opportunity[]){
- const rows=applyItemUse(base,state.itemUses||{},state.recipeUses||{},state.blizzardMetadata||{});
+ const rows=applyItemUse(base,state.itemUses||{},state.recipeUses||{},state.blizzardMetadata||{},state.itemCatalog);
  return provisional?rows.map(row=>({...row,confidence:'watch' as const,reasons:['Auction house mapping is unverified; compare in-game prices before acting.',...row.reasons]})):rows;
 }
 
@@ -258,6 +267,65 @@ function refresh(){
  cachedBase=snapshot?scan(snapshot,snapshots,settings):[];
  cached=decorateScan(cachedBase);
  if(!demo){const ids=[...cached.slice(0,100).map(row=>row.itemId),...state.watch];nameResolver.enqueue(ids);metadataResolver.enqueue(ids);}
+}
+
+// Keep a compact, version-pinned category catalog for every item in the
+// current book. A batch is committed only after the complete request succeeds.
+function scheduleItemCatalog(delay=3_000){
+ if(demo||catalogTimer)return;
+ catalogTimer=setTimeout(()=>{catalogTimer=undefined;void updateItemCatalog();},delay);
+ catalogTimer.unref();
+}
+
+async function updateItemCatalog(){
+ if(demo||catalogBusy)return;
+ if(busy){scheduleItemCatalog(30_000);return;}
+ const snapshot=latest();
+ if(!snapshot)return;
+ const ids=[...snapshot.items.keys()];
+ if(!ids.length)return;
+ const previous=state.itemCatalog;
+ const now=Date.now();
+ const lastCheck=previous?.checkedAt||0;
+ const lastFull=previous?.fetchedAt||0;
+ const full=!previous||lastFull>now||now-lastFull>=liveDataRetentionMs;
+ const missing=new Set(previous?.missingIds||[]);
+ const unseen=ids.filter(id=>!previous?.items?.[String(id)]&&!missing.has(id));
+ if(!full&&!unseen.length&&lastCheck<=now&&now-lastCheck<24*3_600_000)return;
+ catalogBusy=true;
+ try{
+  let result=await fetchForeverItems(full?ids:unseen,{signal:recipeAbort.signal});
+  let replace=full||!previous||previous.dataset!==result.dataset||previous.build!==result.build;
+  if(replace&&!full&&previous){
+   // A changed dataset cannot be merged with records from the previous build.
+   result=await fetchForeverItems(ids,{signal:recipeAbort.signal});
+   replace=true;
+  }
+  const recordedAt=Date.now();
+  const items=replace?{}:{...previous?.items};
+  const misses=new Set(replace?[]:previous?.missingIds||[]);
+  for(const [id,item] of Object.entries(result.items)){
+   const old=previous?.items?.[id];
+   const updatedAt=old&&old.classId===item.classId&&old.subclassId===item.subclassId&&old.quality===item.quality&&old.slot===item.slot&&Number.isFinite(old.updatedAt)&&old.updatedAt>0&&old.updatedAt<=recordedAt?old.updatedAt:recordedAt;
+   items[id]={classId:item.classId,subclassId:item.subclassId,updatedAt,...(item.name?{name:item.name}:{}),...(item.quality!==undefined?{quality:item.quality}:{}),...(item.slot!==undefined?{slot:item.slot}:{})};
+   misses.delete(Number(id));
+  }
+  for(const id of result.missingIds)misses.add(id);
+  // Current items take priority if long-lived markets accumulate many IDs.
+  const keep=new Set(ids.map(String));
+  const extra=Object.keys(items).filter(id=>!keep.has(id)).sort((a,b)=>items[b].updatedAt-items[a].updatedAt);
+  for(const id of extra.slice(Math.max(0,10_000-keep.size)))delete items[id];
+  const next={dataset:result.dataset,build:result.build,checkedAt:recordedAt,fetchedAt:replace?recordedAt:previous!.fetchedAt,items,missingIds:[...misses].filter(id=>keep.has(String(id))).slice(0,10_000)};
+  state.itemCatalog=next;
+  try{await save();}catch(error){if(state.itemCatalog===next)state.itemCatalog=previous;throw error;}
+  catalogError=null;
+  refreshUseViews();
+ }catch(error){
+  if(!recipeAbort.signal.aborted){catalogError='Item categories are temporarily unavailable. Saved classifications remain available; the app will retry.';console.warn('Item catalog refresh failed:',errorMessage(error));scheduleItemCatalog(5*60_000);}
+ }finally{
+  catalogBusy=false;
+  if(latest()?.key!==snapshot.key)scheduleItemCatalog(2_000);
+ }
 }
 
 function scanFor(configured:Settings,strategy:'monopolization'|'flipping'='monopolization'){
@@ -381,6 +449,7 @@ async function collect(){
   return false;
  }finally{
   busy=false;
+  if(!demo)scheduleItemCatalog(2_000);
  }
 }
 
@@ -394,6 +463,8 @@ const pollMinutes=Math.max(5,positiveInteger('POLL_MINUTES',60));
 const interval=collectSchedule==='interval'?setInterval(()=>void collect(),pollMinutes*60_000):undefined;
 const recipeStart=!demo?setTimeout(()=>void updateRecipes(),3_000):undefined;
 const recipeInterval=!demo?setInterval(()=>void updateRecipes(),3_600_000):undefined;
+if(!demo)scheduleItemCatalog();
+const catalogInterval=!demo?setInterval(()=>scheduleItemCatalog(),3_600_000):undefined;
 const port=positiveInteger('PORT',3000);
 const host=process.env.HOST||'127.0.0.1';
 const allowedHosts=csv('APP_TRUSTED_HOSTS',[`localhost:${port}`,`127.0.0.1:${port}`,'localhost:5173','127.0.0.1:5173']);
@@ -510,7 +581,17 @@ const server=createServer(async(request,response)=>{
    requireMethod(method,'GET');
    if(!demo){const ids=[...state.watch,...state.trades.map(trade=>trade.itemId),...state.alerts.map(alert=>alert.itemId)];nameResolver.enqueue(ids);metadataResolver.enqueue(ids);}
    const snapshot=latest();
-   json(response,{mode,market,houseVerified,at:snapshot?.at||null,listingCount:snapshot?.listingCount||0,snapshots:snapshots.length,collector:{busy,lastChecked,lastSuccess,lastError:lastCollectionError||null,nextScheduledAt:collectSchedule==='interval'&&lastChecked?lastChecked+pollMinutes*60_000:null},settings:userSettings,watch:state.watch,names:state.names,nameSources:state.nameSources||{},itemUses:state.itemUses||{},recipeUses:state.recipeUses||{},blizzardMetadata:state.blizzardMetadata||{},metadataError,recipeIndex:state.recipeIndex||null,recipeLookup:{busy:recipeBusy,error:recipeError},stale:!snapshot||Date.now()-snapshot.at>7_200_000});
+   const catalogNames:Record<number,string>={};
+   for(const id of Object.keys(state.itemCatalog?.items||{})){const name=catalogName(Number(id));if(name)catalogNames[Number(id)]=name;}
+   const names={...catalogNames};
+   for(const [id,name] of Object.entries(state.names))if(name&&name!==`Item #${id}`)names[Number(id)]=name;
+   let classified=0,knownUses=0;
+   if(snapshot)for(const id of snapshot.items.keys()){
+    const use=itemUseFor(state.itemUses||{},id,state.recipeUses||{},state.blizzardMetadata||{},state.itemCatalog);
+    if(use&&use.kind!=='exclude')knownUses++;
+    if(itemCategoryFor(id,state.blizzardMetadata||{},state.itemCatalog))classified++;
+   }
+   json(response,{mode,market,houseVerified,at:snapshot?.at||null,listingCount:snapshot?.listingCount||0,snapshots:snapshots.length,collector:{busy,lastChecked,lastSuccess,lastError:lastCollectionError||null,nextScheduledAt:collectSchedule==='interval'&&lastChecked?lastChecked+pollMinutes*60_000:null},settings:userSettings,watch:state.watch,names,nameSources:state.nameSources||{},itemUses:state.itemUses||{},recipeUses:state.recipeUses||{},blizzardMetadata:state.blizzardMetadata||{},itemCatalog:state.itemCatalog||null,catalogLookup:{busy:catalogBusy,error:catalogError,classified,knownUses,total:snapshot?.items.size||0},metadataError,recipeIndex:state.recipeIndex||null,recipeLookup:{busy:recipeBusy,error:recipeError},stale:!snapshot||Date.now()-snapshot.at>7_200_000});
    return;
   }
   if(path==='/api/settings'){
@@ -572,7 +653,7 @@ const server=createServer(async(request,response)=>{
    catch{fail(422,'INVALID_FILTERS','The bankroll or ROI filter is invalid.', 'Enter a positive bankroll and an ROI between 0% and 1000%.');}
    const snapshot=latest();
    const unsorted=snapshot?scanFor(configured,requestedStrategy):[];
-   const nameForId=(id:number)=>{const name=state.names[id];return name&&name!==`Item #${id}`?name:undefined;};
+   const nameForId=(id:number)=>{const name=state.names[id];return name&&name!==`Item #${id}`?name:catalogName(id);};
    const watched=watch==='1'?new Set(state.watch):undefined;
    const filtered=unsorted.filter(row=>{
     const name=nameForId(row.itemId);
@@ -602,12 +683,12 @@ const server=createServer(async(request,response)=>{
   }
   if(path==='/api/backtest'){
    requireMethod(method,'GET');
-   json(response,provisional?[]:backtest(snapshots,userSettings).filter(result=>{const evidence=itemUseFor(state.itemUses||{},result.itemId,state.recipeUses||{},state.blizzardMetadata||{});return !!evidence&&evidence.kind!=='exclude'&&evidence.updatedAt<=result.at;}));
+   json(response,provisional?[]:backtest(snapshots,userSettings).filter(result=>{const evidence=itemUseFor(state.itemUses||{},result.itemId,state.recipeUses||{},state.blizzardMetadata||{},state.itemCatalog);return !!evidence&&evidence.kind!=='exclude'&&evidence.updatedAt<=result.at;}));
    return;
   }
   if(path==='/api/alerts'){
    requireMethod(method,'GET');
-   json(response,provisional?[]:state.alerts.filter(alert=>{const evidence=itemUseFor(state.itemUses||{},alert.itemId,state.recipeUses||{},state.blizzardMetadata||{});return !!evidence&&evidence.kind!=='exclude'&&evidence.updatedAt<=alert.at;}));
+   json(response,provisional?[]:state.alerts.filter(alert=>{const evidence=itemUseFor(state.itemUses||{},alert.itemId,state.recipeUses||{},state.blizzardMetadata||{},state.itemCatalog);return !!evidence&&evidence.kind!=='exclude'&&evidence.updatedAt<=alert.at;}));
    return;
   }
   if(path==='/api/portfolio'){
@@ -697,7 +778,9 @@ server.listen(port,host,()=>console.log(`AH Corner ${mode}: http://${host}:${por
 function shutdown(){
  clearInterval(interval);
  clearInterval(recipeInterval);
+ clearInterval(catalogInterval);
  clearTimeout(recipeStart);
+ if(catalogTimer)clearTimeout(catalogTimer);
  recipeAbort.abort();
  nameResolver.close();
  metadataResolver.close();

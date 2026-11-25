@@ -1,8 +1,8 @@
 import React,{useEffect,useRef,useState} from 'react';
 import {createRoot} from 'react-dom/client';
 import type {Alert,Opportunity,Settings,Stats,Trade} from '../src/types.ts';
-import type {BlizzardItemMetadataMap,ItemUseKind,ItemUseMap,RecipeUseMap} from '../src/item-use.ts';
-import {itemUseFor} from '../src/item-use.ts';
+import type {BlizzardItemMetadataMap,ItemCategoryIndex,ItemUseKind,ItemUseMap,RecipeUseMap,ResolvedItemUse} from '../src/item-use.ts';
+import {itemCategoryFor,itemUseFor} from '../src/item-use.ts';
 import type {ItemNameDetails} from '../src/blizzard.ts';
 import {formatMoney as money,opportunityInsights} from '../src/insights.ts';
 import {defaultOpportunitySort,nextOpportunitySort,sortOpportunities} from '../src/opportunity-sort.ts';
@@ -47,6 +47,7 @@ async function api<T>(path:string,body?:unknown):Promise<T>{
 
 const unit=(c:number)=>money(c);
 const pct=(n:number)=>`${Math.round(n*100)}%`;
+const useSourceLabel=(source:ResolvedItemUse['source'])=>source==='player'?'player research':source==='blizzard-forever'?'Blizzard Forever item data':source==='warcraftforever-item'?'Warcraft Forever item data':'Warcraft Forever recipe data';
 
 function ItemLink({id,name,source}:{id:number;name:string;source?:ItemNameDetails['source']}){
  return <><a href={`https://www.wowhead.com/forever/item=${id}`} target="_blank" rel="noopener noreferrer" onClick={event=>event.stopPropagation()}>{name}</a>{source&&source!=='forever'&&<small>{source==='classic-era'?'Classic Era':'Classic progression'} name · verify in Forever</small>}</>;
@@ -77,7 +78,7 @@ function HistoryChart({history,loading}:{history:Stats[];loading:boolean}){
 }
 
 type Collector={busy:boolean;lastChecked:number;lastSuccess:number;lastError:PublicProblem|null;nextScheduledAt:number|null};
-type Status={mode:string;market:string;houseVerified:boolean;at:number|null;listingCount:number;snapshots:number;collector:Collector;settings:Settings;watch:number[];names:Record<number,string>;nameSources:Record<number,ItemNameDetails['source']>;itemUses:ItemUseMap;recipeUses:RecipeUseMap;blizzardMetadata:BlizzardItemMetadataMap;metadataError:string|null;recipeIndex:{dataset:string;build:string;fetchedAt:number}|null;recipeLookup:{busy:boolean;error:string|null};stale:boolean};
+type Status={mode:string;market:string;houseVerified:boolean;at:number|null;listingCount:number;snapshots:number;collector:Collector;settings:Settings;watch:number[];names:Record<number,string>;nameSources:Record<number,ItemNameDetails['source']>;itemUses:ItemUseMap;recipeUses:RecipeUseMap;blizzardMetadata:BlizzardItemMetadataMap;itemCatalog?:ItemCategoryIndex;catalogLookup?:{busy:boolean;error:string|null;classified:number;knownUses?:number;total:number};metadataError:string|null;recipeIndex:{dataset:string;build:string;fetchedAt:number}|null;recipeLookup:{busy:boolean;error:string|null};stale:boolean};
 type Position={itemId:number;quantity:number;basis:number;realized:number;unmatched:number};
 type Backtest={at:number;itemId:number;target:number;cost:number;potentialProfit:number;competingUnits:number;held:boolean};
 type StrategyKind='monopolization'|'flipping';
@@ -155,11 +156,13 @@ function App({onLogout}:{onLogout?:()=>void}){
  const [form,setForm]=useState({side:'buy',itemId:'',quantity:'',total:'',fee:'0'});
  const resolvedName=(itemId:number)=>{const value=status?.names[itemId];return value&&value!==`Item #${itemId}`?value:undefined;};
  const name=(itemId:number)=>resolvedName(itemId)||`Item #${itemId} (name unavailable)`;
- const use=(itemId:number)=>itemUseFor(status?.itemUses||{},itemId,status?.recipeUses||{},status?.blizzardMetadata||{});
- const consumableUse=(itemId:number)=>itemUseFor({},itemId,{},status?.blizzardMetadata||{});
+ const use=(itemId:number)=>itemUseFor(status?.itemUses||{},itemId,status?.recipeUses||{},status?.blizzardMetadata||{},status?.itemCatalog);
+ const consumableUse=(itemId:number)=>{const result=itemUseFor({},itemId,{},status?.blizzardMetadata||{},status?.itemCatalog);return result?.kind==='consumable'?result:undefined;};
+ const category=(itemId:number)=>itemCategoryFor(itemId,status?.blizzardMetadata||{},status?.itemCatalog);
  const useLabel=(itemId:number)=>{
-  const primary=use(itemId),secondary=consumableUse(itemId);
-  return primary?.source==='warcraftforever-recipe'&&secondary?`${primary.kind} · ${secondary.kind}`:primary?.kind||'use unknown';
+  const primary=use(itemId),secondary=consumableUse(itemId),itemCategory=category(itemId);
+  const useName=primary?.source==='warcraftforever-recipe'&&secondary?`${primary.kind} · ${secondary.kind}`:primary?.kind;
+  return itemCategory?`${itemCategory.label} · ${useName||'use unverified'}`:useName||'use unknown';
  };
  const filtered=sortOpportunities(rows,sort,name);
  const active=filtered.find(row=>row.itemId===id)||filtered[0];
@@ -249,6 +252,7 @@ function App({onLogout}:{onLogout?:()=>void}){
  const insights=active&&status?opportunityInsights(active,status.settings):undefined;
  const activeUse=active?use(active.itemId):undefined;
  const activeConsumable=active?consumableUse(active.itemId):undefined;
+ const activeCategory=active?category(active.itemId):undefined;
  const activeBlockers=active&&status?blockers(active,status,!!activeUse):[];
  const canConsider=!!active&&!!status&&active.confidence==='candidate'&&!activeBlockers.length;
 
@@ -300,9 +304,10 @@ function App({onLogout}:{onLogout?:()=>void}){
      <label className="check"><input type="checkbox" checked={onlyWatch} onChange={event=>{onlyWatchRef.current=event.target.checked;setOnlyWatch(event.target.checked);setLoadingRows(true);setRows([]);}}/> Watchlist only</label>
      <label className="check"><input type="checkbox" checked={showUnnamed} onChange={event=>{showUnnamedRef.current=event.target.checked;setShowUnnamed(event.target.checked);setLoadingRows(true);setRows([]);}}/> Include items without names</label>
     </section>
+    {status?.catalogLookup&&<p className="metric-explainer">Item types classified: {status.catalogLookup.classified.toLocaleString()} of {status.catalogLookup.total.toLocaleString()} distinct items in the latest market snapshot{status.catalogLookup.total?` (${(Math.floor(status.catalogLookup.classified/status.catalogLookup.total*1_000)/10).toFixed(1)}%)`:''}.{typeof status.catalogLookup.knownUses==='number'?` Specific uses identified: ${status.catalogLookup.knownUses.toLocaleString()} of ${status.catalogLookup.total.toLocaleString()}.`:''} Item type does not establish a specific use or player demand.{status.catalogLookup.busy?' Item catalog is refreshing.':''}{status.catalogLookup.error?` ${status.catalogLookup.error}`:''}</p>}
     <details className="panel">
      <summary>Record item-use research</summary>
-     <p className="muted">Uses come from cached Blizzard item categories and <a href="https://warcraftforever.com/developers/data/" target="_blank" rel="noopener noreferrer">Warcraft Forever recipe data</a>. Missing categories are checked gradually in the background; items without evidence stay watch-only. Your research overrides automatic evidence; choose Unknown to clear your override. Excluded items are hidden.</p>
+     <p className="muted">Categories come from saved Blizzard and <a href="https://warcraftforever.com/developers/data/" target="_blank" rel="noopener noreferrer">Warcraft Forever item data</a>. A category such as trade goods does not prove a specific use; items without use evidence stay watch-only. Your research overrides automatic use evidence; choose Unknown to clear your override. Excluded items are hidden.</p>
      {status?.metadataError&&<p className="muted">{status.metadataError}</p>}
      {status?.mode==='live'&&status.recipeLookup?.error&&<p className="muted">{status.recipeLookup.error}</p>}
      {!status?.recipeIndex&&status?.mode==='live'&&!status.recipeLookup?.error&&<p className="muted">Loading the recipe index; items without research remain watch-only.</p>}
@@ -358,13 +363,13 @@ function App({onLogout}:{onLogout?:()=>void}){
        </details>
        <section className="insight-section">
         <h4>Why {canConsider?'the app found this':'the app says to hold off'}</h4>
-        <p className="why-summary">{activeUse?`Known use: ${activeUse.kind}, from ${activeUse.source==='player'?'your research':activeUse.source==='blizzard-forever'?'Blizzard item data':'recipe data'} (${activeUse.note}). A known use does not prove demand.`:'The item’s use is not yet known.'} {active.historyCount?`${pct(active.support)} of ${active.historyCount} prior observed price floors were at or above the proposed target.`:'There are no prior price floors to support the proposed target yet.'} {active.removedUnits===null?'No comparable listing intervals are available.':`About ${active.removedUnits.toFixed(1)} units/hour disappeared at or below the target${active.replenish===null?'.':`, while ${active.replenish.toFixed(1)} units/hour appeared below it.`}`} Disappearing listings may have sold, expired or been cancelled.</p>
+        <p className="why-summary">{activeCategory?`Item category: ${activeCategory.label} (${activeCategory.source==='blizzard-forever'?'Blizzard Forever item data':'Warcraft Forever item data'}). `:''}{activeUse?`Known use: ${activeUse.kind}, from ${useSourceLabel(activeUse.source)} (${activeUse.note}). A known use does not prove demand.`:'The item’s specific use is not yet known.'} {active.historyCount?`${pct(active.support)} of ${active.historyCount} prior observed price floors were at or above the proposed target.`:'There are no prior price floors to support the proposed target yet.'} {active.removedUnits===null?'No comparable listing intervals are available.':`About ${active.removedUnits.toFixed(1)} units/hour disappeared at or below the target${active.replenish===null?'.':`, while ${active.replenish.toFixed(1)} units/hour appeared below it.`}`} Disappearing listings may have sold, expired or been cancelled.</p>
         {strategy==='monopolization'&&active.monopoly&&<p className="why-summary">The buyout covers {pct(active.monopoly.plannedShare)} of the {active.monopoly.snapshotUnits.toLocaleString()} units listed in this snapshot. Existing inventory and hidden or future supply are not counted, so this does not measure market ownership or control.</p>}
         {strategy==='flipping'&&active.flip&&<p className="why-summary">Recent median floor: {active.flip.historicalMedian===null?'not available':`${unit(active.flip.historicalMedian)} per unit`}; cheapest remaining listing: {unit(active.flip.remainingFloor)} per unit. {active.flip.observedRemovalsPerDay===null?'Not enough comparable history to estimate listing movement.':`Historical listing removals averaged ${active.flip.observedRemovalsPerDay.toFixed(1)} units per day, extrapolated from comparable snapshots.`} Disappearances are not verified sales, and this does not predict when your listing will sell.</p>}
         <details className="supporting-detail"><summary>Show all market checks</summary>
         <ul className="check-list">
          <li className={`check-row ${provisional?'warning':'pass'}`}><span className="check-icon" aria-hidden="true">{provisional?'!':'✓'}</span><div className="check-copy"><strong>Auction house · {provisional?'unverified':status.mode==='demo'?'demo':'verified'}</strong><small>{provisional?'Compare prices with your in-game US PvP Horde auction house before relying on this market.':status.mode==='demo'?'Synthetic data for testing only.':'The selected auction house has been marked verified.'}</small></div></li>
-         <li className={`check-row ${activeUse?'pass':'unknown'}`}><span className="check-icon" aria-hidden="true">{activeUse?'✓':'?'}</span><div className="check-copy"><strong>Item use · {activeUse?activeUse.kind:'unknown'}</strong><small>{activeUse?`${activeUse.source==='player'?'Player research':activeUse.source==='blizzard-forever'?'Blizzard Forever item data':'Recipe evidence'}: ${activeUse.note}. A use does not prove demand or sales.`:'No use is known yet; the item category may still be loading. Research it before trading.'}</small>{activeUse?.source==='warcraftforever-recipe'&&activeConsumable&&<small>Blizzard Forever item data also identifies this as {activeConsumable.note.toLowerCase()}.</small>}{activeUse?.source==='warcraftforever-recipe'&&<a href={`https://warcraftforever.com/spells/${activeUse.recipeId}`} target="_blank" rel="noopener noreferrer">View source recipe</a>}</div></li>
+         <li className={`check-row ${activeUse?'pass':'unknown'}`}><span className="check-icon" aria-hidden="true">{activeUse?'✓':'?'}</span><div className="check-copy"><strong>Item use · {activeUse?activeUse.kind:'unknown'}</strong><small>{activeUse?`${useSourceLabel(activeUse.source)}: ${activeUse.note}. A use does not prove demand or sales.`:'No specific use is known yet. The item category alone does not prove its use; research it before trading.'}</small>{activeUse?.source==='warcraftforever-recipe'&&activeConsumable&&<small>{useSourceLabel(activeConsumable.source)} also identifies this as {activeConsumable.note.toLowerCase()}.</small>}{activeUse?.source==='warcraftforever-recipe'&&<a href={`https://warcraftforever.com/spells/${activeUse.recipeId}`} target="_blank" rel="noopener noreferrer">View source recipe</a>}</div></li>
          {strategy==='flipping'&&active.flip&&<li className={`check-row ${active.flip.enoughMovement===true?'pass':active.flip.enoughMovement===false?'warning':'unknown'}`}><span className="check-icon" aria-hidden="true">{active.flip.enoughMovement===true?'✓':active.flip.enoughMovement===false?'!':'?'}</span><div className="check-copy"><strong>24-hour movement · {active.flip.enoughMovement===true?'meets model check':active.flip.enoughMovement===false?'needs attention':'not enough data'}</strong><small>Historical listing removals are compared with the proposed quantity as a rough signal only; they are not verified sales or a prediction of resale time.</small></div></li>}
          {insights.checks.map(check=><li className={`check-row ${check.status==='caution'?'warning':check.status}`} key={check.key}><span className="check-icon" aria-hidden="true">{check.status==='pass'?'✓':check.status==='caution'?'!':'?'}</span><div className="check-copy"><strong>{check.label} · {check.status==='pass'?'meets model check':check.status==='caution'?'needs attention':'not enough data'}</strong><small>{check.detail}</small></div></li>)}
         </ul>

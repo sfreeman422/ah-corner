@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import {applyItemUse,itemUseFor,validateItemUse} from '../src/item-use.ts';
-import type {BlizzardItemMetadataMap,ItemUseMap,RecipeUseMap} from '../src/item-use.ts';
+import {applyItemUse,itemCategoryFor,itemUseFor,validateItemUse} from '../src/item-use.ts';
+import type {BlizzardItemMetadataMap,ItemCategoryIndex,ItemUseMap,RecipeUseMap} from '../src/item-use.ts';
 import {defaults,scan} from '../src/engine.ts';
 import {demoSnapshots} from '../src/demo.ts';
 
@@ -104,4 +104,76 @@ test('missing, malformed or non-Forever metadata remains unknown',()=>{
   const metadata={1:{...valid,...change}} as unknown as BlizzardItemMetadataMap;
   assert.equal(itemUseFor({},1,{},metadata),undefined);
  }
+});
+
+test('item categories describe the recorded Forever classes without inventing item uses',()=>{
+ const now=Date.now();
+ const cases:[number,number,string,boolean][]=[
+  [1,2,'Container · Herb Bag',true],
+  [2,7,'Weapon · Sword',false],
+  [4,2,'Armor · Leather',false],
+  [5,0,'Reagent',false],
+  [6,2,'Projectile · Arrow',false],
+  [7,5,'Trade Goods · Cloth',false],
+  [7,9,'Trade Goods · Herb',false],
+  [7,11,'Trade Goods · Other',false],
+  [9,6,'Recipe · Alchemy',true],
+  [11,3,'Quiver · Ammo Pouch',true],
+  [12,0,'Quest',false],
+  [13,0,'Key',false],
+  [15,0,'Miscellaneous · Junk',false],
+  [15,2,'Miscellaneous · Pet',false],
+  [0,8,'Consumable · Other',false]
+ ];
+ const candidate=scan(demoSnapshots().at(-1)!,demoSnapshots(),defaults).find(row=>row.confidence==='candidate')!;
+ for(const [classId,subclassId,label,eligible] of cases){
+  const metadata:BlizzardItemMetadataMap={[candidate.itemId]:{source:'blizzard-forever',classId,subclassId,updatedAt:now-1,checkedAt:now}};
+  assert.equal(itemCategoryFor(candidate.itemId,metadata)?.label,label);
+  const use=itemUseFor({},candidate.itemId,{},metadata);
+  assert.equal(!!use,eligible,`${label} evidence`);
+  assert.equal(applyItemUse([candidate],{},{},metadata)[0].confidence,eligible?'candidate':'watch',`${label} gating`);
+ }
+});
+
+test('catalog categories preserve source and per-item evidence time; validated Blizzard metadata takes precedence',()=>{
+ const now=Date.now();
+ const corpus:ItemCategoryIndex={dataset:'items-42',build:'1.2.3',fetchedAt:now,checkedAt:now,items:{
+  1:{classId:7,subclassId:9,updatedAt:now-20},
+  2:{classId:0,subclassId:5,updatedAt:now-10},
+  3:{classId:2,subclassId:7,updatedAt:now-5,quality:2,slot:13}
+ }};
+ assert.deepEqual(itemCategoryFor(1,{},corpus),{label:'Trade Goods · Herb',classId:7,subclassId:9,source:'warcraftforever-item',dataset:'items-42',build:'1.2.3',updatedAt:now-20,checkedAt:now});
+ assert.equal(itemUseFor({},1,{}, {},corpus),undefined,'trade category is not recipe evidence');
+ assert.equal(itemUseFor({},2,{}, {},corpus)?.kind,'consumable');
+ assert.equal(itemUseFor({},3,{}, {},corpus)?.kind,'equipment');
+ assert.equal(itemUseFor({},3,{}, {},corpus)?.updatedAt,now-5,'evidence is not backdated to another item');
+ const blizzard:BlizzardItemMetadataMap={2:{source:'blizzard-forever',classId:4,subclassId:1,checkedAt:now,updatedAt:now-1}};
+ assert.equal(itemCategoryFor(2,blizzard,corpus)?.label,'Armor · Cloth');
+ assert.equal(itemUseFor({},2,{},blizzard,corpus),undefined,'conflicting catalog category cannot establish gear quality');
+ const expired:BlizzardItemMetadataMap={2:{source:'blizzard-forever',classId:4,subclassId:1,checkedAt:now-31*24*60*60_000,updatedAt:now-31*24*60*60_000}};
+ assert.equal(itemCategoryFor(2,expired,corpus)?.source,'warcraftforever-item');
+ for(const invalid of [{dataset:''},{build:''},{checkedAt:now+60_000},{items:{2:{...corpus.items[2],updatedAt:now+60_000}}}]){
+  assert.equal(itemCategoryFor(2,{}, {...corpus,...invalid}),undefined);
+ }
+ assert.equal(itemCategoryFor(99,{},corpus),undefined);
+});
+
+test('equipment eligibility needs matching non-poor quality and is never backdated',()=>{
+ const now=Date.now(),old=now-20_000,newer=now-1_000;
+ const metadata:BlizzardItemMetadataMap={1:{source:'blizzard-forever',classId:4,subclassId:0,updatedAt:old,checkedAt:now}};
+ const entry={classId:4,subclassId:0,updatedAt:newer,quality:1,slot:1};
+ const corpus:ItemCategoryIndex={dataset:'items',build:'1',fetchedAt:now,checkedAt:now,items:{1:entry}};
+ const use=itemUseFor({},1,{},metadata,corpus);
+ assert.equal(itemCategoryFor(1,metadata,corpus)?.source,'blizzard-forever');
+ assert.equal(use?.kind,'equipment');
+ assert.equal(use?.source,'warcraftforever-item');
+ assert.equal(use?.updatedAt,newer,'quality and slot were established after Blizzard class');
+ for(const change of [{quality:0},{quality:undefined},{quality:-1},{quality:1.5},{slot:0},{slot:undefined},{subclassId:1},{updatedAt:now+60_000}]){
+  const invalid={...corpus,items:{1:{...entry,...change}}};
+  assert.equal(itemUseFor({},1,{},metadata,invalid),undefined,`ineligible gear: ${JSON.stringify(change)}`);
+  assert.equal(itemCategoryFor(1,metadata,invalid)?.label,'Armor · Miscellaneous');
+ }
+ const weapon={...metadata,1:{...metadata[1],classId:2,subclassId:7}};
+ const goodWeapon={...corpus,items:{1:{...entry,classId:2,subclassId:7,slot:undefined}}};
+ assert.equal(itemUseFor({},1,{},weapon,goodWeapon)?.kind,'equipment');
 });
