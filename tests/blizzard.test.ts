@@ -61,3 +61,63 @@ test('unexpected not-modified responses fail instead of marking collection succe
   if(oldSecret===undefined)delete process.env.BLIZZARD_CLIENT_SECRET;else process.env.BLIZZARD_CLIENT_SECRET=oldSecret;
  }
 });
+
+test('item names prefer Forever and fall back to Classic namespaces only on 404',async()=>{
+ const previous=globalThis.fetch;
+ const oldId=process.env.BLIZZARD_CLIENT_ID,oldSecret=process.env.BLIZZARD_CLIENT_SECRET,oldRegion=process.env.REGION;
+ process.env.BLIZZARD_CLIENT_ID='mock';process.env.BLIZZARD_CLIENT_SECRET='mock';process.env.REGION='us';
+ const requests:string[]=[];
+ let responses:Record<string,Response>={};
+ try{
+  globalThis.fetch=async(input)=>{
+   const url=new URL(String(input));
+   if(url.hostname==='oauth.battle.net')return Response.json({access_token:'test',expires_in:3600});
+   const namespace=url.searchParams.get('namespace')!;
+   requests.push(namespace);
+   assert.ok(responses[namespace],`unexpected namespace ${namespace}`);
+   return responses[namespace].clone();
+  };
+  const client=new Blizzard();
+  const missing=()=>new Response(null,{status:404});
+  responses={'static-forever-us':Response.json({name:'Forever Linen'})};
+  assert.deepEqual(await client.nameDetails(2589),{name:'Forever Linen',source:'forever'});
+  assert.deepEqual(requests.splice(0),['static-forever-us']);
+
+  responses={'static-forever-us':missing(),'static-classic1x-us':Response.json({name:{en_US:'Era Linen'}})};
+  assert.deepEqual(await client.nameDetails(2589),{name:'Era Linen',source:'classic-era'});
+  assert.deepEqual(requests.splice(0),['static-forever-us','static-classic1x-us']);
+
+  responses={'static-forever-us':missing(),'static-classic1x-us':missing(),'static-classic-us':Response.json({name:"Advisor's Pack"})};
+  assert.deepEqual(await client.nameDetails(23658),{name:"Advisor's Pack",source:'classic-progression'});
+  assert.deepEqual(requests.splice(0),['static-forever-us','static-classic1x-us','static-classic-us']);
+  assert.equal(await client.name(23658),"Advisor's Pack");
+  requests.length=0;
+
+  responses={'static-forever-us':missing(),'static-classic1x-us':missing(),'static-classic-us':missing()};
+  assert.equal(await client.nameDetails(999999),null);
+  assert.equal(await client.name(999999),'Item #999999');
+  requests.length=0;
+
+  responses={'static-forever-us':new Response(null,{status:403})};
+  await assert.rejects(()=>client.nameDetails(2589),/Item HTTP 403 \(forever\)/);
+  assert.deepEqual(requests.splice(0),['static-forever-us']);
+
+  responses={'static-forever-us':missing(),'static-classic1x-us':new Response(null,{status:403})};
+  await assert.rejects(()=>client.nameDetails(2589),/Item HTTP 403 \(classic-era\)/);
+  assert.deepEqual(requests.splice(0),['static-forever-us','static-classic1x-us']);
+
+  responses={'static-forever-us':Response.json({name:{}})};
+  await assert.rejects(()=>client.nameDetails(2589),/Item name missing \(forever\)/);
+  assert.deepEqual(requests.splice(0),['static-forever-us']);
+
+  // The public get() has already exhausted retries when it returns a 429.
+  client.get=async()=>new Response(null,{status:429});
+  await assert.rejects(()=>client.nameDetails(2589),/Item HTTP 429 \(forever\)/);
+  assert.deepEqual(requests,[]);
+ }finally{
+  globalThis.fetch=previous;
+  if(oldId===undefined)delete process.env.BLIZZARD_CLIENT_ID;else process.env.BLIZZARD_CLIENT_ID=oldId;
+  if(oldSecret===undefined)delete process.env.BLIZZARD_CLIENT_SECRET;else process.env.BLIZZARD_CLIENT_SECRET=oldSecret;
+  if(oldRegion===undefined)delete process.env.REGION;else process.env.REGION=oldRegion;
+ }
+});

@@ -1,15 +1,36 @@
 import {createHash} from 'node:crypto';
 import {normalize} from './engine.ts';import type {Snapshot} from './types.ts';
+export type ItemNameDetails={name:string;source:'forever'|'classic-era'|'classic-progression'};
 export class Blizzard{
  region=process.env.REGION||'us';ruleset=Number(process.env.RULESET_ID||1);private token='';private expires=0;
  constructor(){if(!['us','eu','kr','tw'].includes(this.region)||!Number.isSafeInteger(this.ruleset)||this.ruleset<=0)throw Error('Invalid region/ruleset');}
  private async auth(){if(this.token&&Date.now()<this.expires)return this.token;const id=process.env.BLIZZARD_CLIENT_ID,secret=process.env.BLIZZARD_CLIENT_SECRET;if(!id||!secret)throw Error('Set Blizzard credentials in .env (never paste them in chat)');const r=await fetch('https://oauth.battle.net/token',{method:'POST',headers:{Authorization:'Basic '+Buffer.from(`${id}:${secret}`).toString('base64'),'Content-Type':'application/x-www-form-urlencoded'},body:'grant_type=client_credentials',signal:AbortSignal.timeout(30000)});if(!r.ok)throw Error(`Blizzard OAuth HTTP ${r.status}`);const b=await r.json();if(typeof b.access_token!=='string')throw Error('Invalid OAuth response');this.token=b.access_token;this.expires=Date.now()+Math.max(0,Number(b.expires_in||3600)-60)*1000;return this.token;}
- async get(path:string,ns='dynamic',modified?:string):Promise<Response>{const url=new URL(`https://${this.region}.api.blizzard.com${path}`);url.searchParams.set('namespace',`${ns}-forever-${this.region}`);url.searchParams.set('locale','en_US');for(let i=0;i<3;i++){const h:Record<string,string>={Authorization:`Bearer ${await this.auth()}`};if(modified)h['If-Modified-Since']=modified;const r=await fetch(url,{headers:h,signal:AbortSignal.timeout(90000)});if(r.status===401&&i===0){this.token='';continue;}if((r.status===429||r.status>=500)&&i<2){await new Promise(resolve=>setTimeout(resolve,Math.min(30000,Math.max(1000,Number(r.headers.get('retry-after')||0)*1000,2000*2**i))));continue;}return r;}throw Error('Blizzard request retries exhausted');}
+ private async request(path:string,namespace:string,modified?:string):Promise<Response>{const url=new URL(`https://${this.region}.api.blizzard.com${path}`);url.searchParams.set('namespace',namespace);url.searchParams.set('locale','en_US');for(let i=0;i<3;i++){const h:Record<string,string>={Authorization:`Bearer ${await this.auth()}`};if(modified)h['If-Modified-Since']=modified;const r=await fetch(url,{headers:h,signal:AbortSignal.timeout(90000)});if(r.status===401&&i===0){this.token='';continue;}if((r.status===429||r.status>=500)&&i<2){await new Promise(resolve=>setTimeout(resolve,Math.min(30000,Math.max(1000,Number(r.headers.get('retry-after')||0)*1000,2000*2**i))));continue;}return r;}throw Error('Blizzard request retries exhausted');}
+ async get(path:string,ns='dynamic',modified?:string):Promise<Response>{return this.request(path,`${ns}-forever-${this.region}`,modified);}
  async houses(){const r=await this.get(`/data/wow/ruleset/${this.ruleset}/auctions/`);if(!r.ok)throw Error(`House index HTTP ${r.status}`);const b=await r.json();if(!Array.isArray(b.auctions))throw Error('Unexpected house index');return b.auctions as {id:number;name:string|Record<string,string>}[];}
  // Fetch the full regular book on every poll: a 304 here cannot say whether the
  // separate commodities endpoint has changed. Storage deduplicates full books.
  async snapshot(house:number,_modified?:string):Promise<{snapshot:Snapshot|null;modified?:string}>{if(!Number.isSafeInteger(house)||house<1)throw Error('Invalid HOUSE_ID');const path=`/data/wow/ruleset/${this.ruleset}/auctions/${house}`;const r=await this.get(path,'dynamic');if(!r.ok)throw Error(`House HTTP ${r.status}`);const b=await r.json();if(b.id!==house||!Array.isArray(b.auctions))throw Error('House mismatch or missing regular auctions');let c=b.commodities; // Some deployments omit embedded commodities or return a linked object.
  if(!Array.isArray(c)){if(Array.isArray(c?.auctions))c=c.auctions;else{const cr=await this.get(path+'/commodities');if(!cr.ok)throw Error(`Commodity HTTP ${cr.status}; rejecting partial book`);c=(await cr.json()).auctions;}}
  if(!Array.isArray(c))throw Error('Missing commodity array; refusing incomplete snapshot');const listings=[...normalize(b.auctions,'auction'),...normalize(c,'commodity')];if(!listings.length)throw Error('Empty priced book');const hash=createHash('sha256');for(const l of [...listings].sort((a,b)=>a.id.localeCompare(b.id)))hash.update(`${l.id}:${l.itemId}:${l.quantity}:${l.total}:${l.timeLeft};`);const lm=r.headers.get('last-modified')||undefined;const at=Date.now();return {snapshot:{key:`${this.region}:${house}:${hash.digest('hex')}`,at,source:'blizzard',market:`${this.region}:${this.ruleset}:${house}`,listings},modified:lm};}
- async name(id:number){const r=await this.get(`/data/wow/item/${id}`,'static');if(r.status===404)return `Item #${id}`;if(!r.ok)throw Error(`Item HTTP ${r.status}`);const b=await r.json();return typeof b.name==='string'?b.name:b.name?.en_US||`Item #${id}`;}
+ async nameDetails(id:number):Promise<ItemNameDetails|null>{
+  if(!Number.isSafeInteger(id)||id<1)throw Error('Invalid item ID');
+  const path=`/data/wow/item/${id}`;
+  const lookups:[ItemNameDetails['source'],()=>Promise<Response>][]=[
+   ['forever',()=>this.get(path,'static')],
+   ['classic-era',()=>this.request(path,`static-classic1x-${this.region}`)],
+   ['classic-progression',()=>this.request(path,`static-classic-${this.region}`)]
+  ];
+  for(const [source,lookup] of lookups){
+   const r=await lookup();
+   if(r.status===404)continue;
+   if(!r.ok)throw Error(`Item HTTP ${r.status} (${source})`);
+   const b=await r.json();
+   const name=typeof b.name==='string'?b.name:b.name?.en_US;
+   if(typeof name!=='string'||!name.trim())throw Error(`Item name missing (${source})`);
+   return {name,source};
+  }
+  return null;
+ }
+ async name(id:number){return (await this.nameDetails(id))?.name??`Item #${id}`;}
 }

@@ -116,6 +116,7 @@ function expireLiveState(){
  let changed=false;
  if(Object.keys(state.names).length&&!(typeof state.namesFetchedAt==='number'&&Number.isFinite(state.namesFetchedAt)&&state.namesFetchedAt<=now&&now-state.namesFetchedAt<liveDataRetentionMs)){
   state.names={};
+  delete state.nameSources;
   delete state.namesFetchedAt;
   changed=true;
  }
@@ -139,11 +140,12 @@ function save(){
 }
 
 const nameResolver=new ItemNameResolver({
- lookup:id=>blizzard.name(id),
+ lookup:id=>blizzard.nameDetails(id),
  isKnown:id=>!!state.names[id]&&state.names[id]!==`Item #${id}`,
- async onName(id,name){
+ async onName(id,{name,source}){
   state.namesFetchedAt??=Date.now();
   state.names[id]=name;
+  (state.nameSources??={})[id]=source;
   await save();
  }
 });
@@ -346,7 +348,7 @@ const server=createServer(async(request,response)=>{
    if(expireLiveState())await save();
    if(!demo)nameResolver.enqueue([...state.watch,...state.trades.map(trade=>trade.itemId),...state.alerts.map(alert=>alert.itemId)]);
    const snapshot=latest();
-   json(response,{mode,market,houseVerified,at:snapshot?.at||null,listingCount:snapshot?.listings.length||0,snapshots:snapshots.length,collector:{busy,lastChecked,lastSuccess,lastError:lastCollectionError||null,nextScheduledAt:collectSchedule==='interval'&&lastChecked?lastChecked+pollMinutes*60_000:null},settings,watch:state.watch,names:state.names,itemUses:state.itemUses||{},stale:!snapshot||Date.now()-snapshot.at>7_200_000});
+   json(response,{mode,market,houseVerified,at:snapshot?.at||null,listingCount:snapshot?.listings.length||0,snapshots:snapshots.length,collector:{busy,lastChecked,lastSuccess,lastError:lastCollectionError||null,nextScheduledAt:collectSchedule==='interval'&&lastChecked?lastChecked+pollMinutes*60_000:null},settings,watch:state.watch,names:state.names,nameSources:state.nameSources||{},itemUses:state.itemUses||{},stale:!snapshot||Date.now()-snapshot.at>7_200_000});
    return;
   }
   if(path==='/api/settings'){

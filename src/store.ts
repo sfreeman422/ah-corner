@@ -3,9 +3,10 @@ import {join} from 'node:path';
 import type {Pool, PoolConnection, PoolOptions, ResultSetHeader, RowDataPacket} from 'mysql2/promise';
 import {groups,stats} from './engine.ts';
 import type {ItemUseMap} from './item-use.ts';
+import type {ItemNameDetails} from './blizzard.ts';
 import type {Alert, Settings, Snapshot, Stats, Trade} from './types.ts';
 
-export type State={names:Record<number,string>;namesFetchedAt?:number;trades:Trade[];alerts:Alert[];watch:number[];modified?:string;strategy?:Settings;itemUses?:ItemUseMap};
+export type State={names:Record<number,string>;nameSources?:Record<number,ItemNameDetails['source']>;namesFetchedAt?:number;trades:Trade[];alerts:Alert[];watch:number[];modified?:string;strategy?:Settings;itemUses?:ItemUseMap};
 export type Store={
  load:()=>Promise<State>;
  save:(s:State)=>Promise<void>;

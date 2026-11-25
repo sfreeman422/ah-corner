@@ -1,7 +1,9 @@
+import type {ItemNameDetails} from './blizzard.ts';
+
 export type ItemNameResolverOptions={
- lookup:(itemId:number)=>Promise<string|null>;
+ lookup:(itemId:number)=>Promise<ItemNameDetails|null>;
  isKnown:(itemId:number)=>boolean;
- onName:(itemId:number,name:string)=>Promise<void>|void;
+ onName:(itemId:number,name:ItemNameDetails)=>Promise<void>|void;
  maxConcurrent?:number;
  maxPerWindow?:number;
  windowMs?:number;
@@ -68,10 +70,10 @@ export class ItemNameResolver{
   try{
    const raw=await this.options.lookup(id);
    if(this.closed)return;
-   const name=typeof raw==='string'?raw.trim():'';
+   const name=typeof raw?.name==='string'?raw.name.trim():'';
    if(!name||name===`Item #${id}`){this.defer(id,this.options.missingTtlMs);return;}
    // Another source may have resolved this item while the lookup was in flight.
-   if(!this.options.isKnown(id))await this.options.onName(id,name);
+   if(!this.options.isKnown(id))await this.options.onName(id,{name,source:raw!.source});
   }catch{
    if(!this.closed)this.defer(id,this.options.retryTtlMs);
   }finally{

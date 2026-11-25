@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {ItemNameResolver} from '../src/item-names.ts';
+import type {ItemNameDetails} from '../src/blizzard.ts';
 
 const delay=(ms:number)=>new Promise(resolve=>setTimeout(resolve,ms));
 async function waitFor(condition:()=>boolean){
@@ -15,8 +16,8 @@ test('resolves requested names with bounded concurrency and deduplicates queued 
  const resolver=new ItemNameResolver({
   maxConcurrent:2,maxPerWindow:100,
   isKnown:id=>!!names[id],
-  async lookup(id){calls.push(id);active++;maxActive=Math.max(maxActive,active);await delay(10);active--;return `Name ${id}`;},
-  async onName(id,name){names[id]=name;}
+  async lookup(id){calls.push(id);active++;maxActive=Math.max(maxActive,active);await delay(10);active--;return {name:`Name ${id}`,source:'forever'};},
+  async onName(id,result){names[id]=result.name;}
  });
  try{
   resolver.enqueue([1,1,2,3,99,0,-1]);
@@ -32,8 +33,8 @@ test('missing names and transient failures are retried only after their backoff'
  const names:Record<number,string>={};
  const resolver=new ItemNameResolver({
   maxPerWindow:100,missingTtlMs:60,retryTtlMs:60,isKnown:id=>!!names[id],
-  async lookup(id){calls[id]=(calls[id]||0)+1;if(calls[id]===1){if(id===2)throw Error('offline');return null;}return `Name ${id}`;},
-  onName(id,name){names[id]=name;}
+  async lookup(id){calls[id]=(calls[id]||0)+1;if(calls[id]===1){if(id===2)throw Error('offline');return null;}return {name:`Name ${id}`,source:'forever'};},
+  onName(id,result){names[id]=result.name;}
  });
  try{
   resolver.enqueue([1,2]);
@@ -54,8 +55,8 @@ test('a rolling request budget delays excess work and fallback placeholders are 
  const names:Record<number,string>={};
  const resolver=new ItemNameResolver({
   maxConcurrent:3,maxPerWindow:2,windowMs:100,missingTtlMs:1000,isKnown:id=>!!names[id],
-  async lookup(id){calls.push(id);return id===1?'Item #1':`Name ${id}`;},
-  onName(id,name){names[id]=name;}
+  async lookup(id){calls.push(id);return {name:id===1?'Item #1':`Name ${id}`,source:'forever'};},
+  onName(id,result){names[id]=result.name;}
  });
  try{
   resolver.enqueue([1,2,3]);
@@ -69,7 +70,7 @@ test('a rolling request budget delays excess work and fallback placeholders are 
 });
 
 test('closing prevents in-flight lookups from updating state',async()=>{
- let release:(value:string)=>void=()=>{};
+ let release:(value:ItemNameDetails)=>void=()=>{};
  let persisted=false;
  const resolver=new ItemNameResolver({
   isKnown:()=>false,
@@ -78,7 +79,21 @@ test('closing prevents in-flight lookups from updating state',async()=>{
  });
  resolver.enqueue([1]);
  resolver.close();
- release('Found name');
+ release({name:'Found name',source:'forever'});
  await delay(5);
  assert.equal(persisted,false);
+});
+
+test('persists a Classic fallback with its source',async()=>{
+ let saved:ItemNameDetails|undefined;
+ const resolver=new ItemNameResolver({
+  isKnown:()=>!!saved,
+  async lookup(){return {name:' Advisor’s Pack ',source:'classic-progression'};},
+  onName(_id,result){saved=result;}
+ });
+ try{
+  resolver.enqueue([23658]);
+  await waitFor(()=>!!saved);
+  assert.deepEqual(saved,{name:'Advisor’s Pack',source:'classic-progression'});
+ }finally{resolver.close();}
 });
