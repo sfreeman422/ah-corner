@@ -5,7 +5,7 @@ import type {IncomingMessage, ServerResponse} from 'node:http';
 import {extname, resolve} from 'node:path';
 import {Blizzard} from './blizzard.ts';
 import {demoSnapshots, names} from './demo.ts';
-import {backtest, compactSnapshot, portfolio, scan, validInt} from './engine.ts';
+import {backtest, compactSnapshot, portfolio, scan, scanFlips, validInt} from './engine.ts';
 import {parseJournal, validateTrade} from './journal.ts';
 import {openStore} from './store.ts';
 import type {Alert, CompactSnapshot, Opportunity, Settings} from './types.ts';
@@ -260,14 +260,14 @@ function refresh(){
  if(!demo){const ids=[...cached.slice(0,100).map(row=>row.itemId),...state.watch];nameResolver.enqueue(ids);metadataResolver.enqueue(ids);}
 }
 
-function scanFor(configured:Settings){
+function scanFor(configured:Settings,strategy:'monopolization'|'flipping'='monopolization'){
  const snapshot=latest();
  if(!snapshot)return [];
- const key=JSON.stringify(configured);
- if(key===JSON.stringify(settings))return cached;
+ const key=JSON.stringify([strategy,configured]);
+ if(strategy==='monopolization'&&JSON.stringify(configured)===JSON.stringify(settings))return cached;
  const found=strategyScans.get(key);
  if(found){strategyScans.delete(key);strategyScans.set(key,found);return found.rows;}
- const base=scan(snapshot,snapshots,configured);
+ const base=strategy==='flipping'?scanFlips(snapshot,snapshots,configured):scan(snapshot,snapshots,configured);
  const rows=decorateScan(base);
  strategyScans.set(key,{base,rows});
  if(strategyScans.size>4)strategyScans.delete(strategyScans.keys().next().value!);
@@ -553,6 +553,12 @@ const server=createServer(async(request,response)=>{
   }
   if(path==='/api/opportunities'){
    requireMethod(method,'GET');
+   const requestedStrategy=url.searchParams.get('strategy')??'monopolization';
+   if(requestedStrategy!=='monopolization'&&requestedStrategy!=='flipping')fail(422,'INVALID_STRATEGY','Choose a valid trading strategy.','Select monopolization or flipping.');
+   const search=(url.searchParams.get('q')??'').trim().toLowerCase();
+   const watch=url.searchParams.get('watch');
+   const named=url.searchParams.get('named');
+   if(search.length>120||(watch!==null&&watch!=='0'&&watch!=='1')||(named!==null&&named!=='0'&&named!=='1'))fail(422,'INVALID_FILTERS','The opportunity filters are invalid.','Use a search of at most 120 characters and choose valid watchlist and name filters.');
    const requestedSort=url.searchParams.get('sort');
    const requestedDirection=url.searchParams.get('direction');
    const sortKeys:readonly string[]=['name','cost','profit','roi','score'];
@@ -565,10 +571,26 @@ const server=createServer(async(request,response)=>{
    try{configured=validSettings({...userSettings,bankroll,minROI});}
    catch{fail(422,'INVALID_FILTERS','The bankroll or ROI filter is invalid.', 'Enter a positive bankroll and an ROI between 0% and 1000%.');}
    const snapshot=latest();
-   const unsorted=snapshot?scanFor(configured):[];
-   const rows=sortOpportunities(unsorted,sort,id=>{const name=state.names[id];return name&&name!==`Item #${id}`?name:`Item #${id}`;});
+   const unsorted=snapshot?scanFor(configured,requestedStrategy):[];
+   const nameForId=(id:number)=>{const name=state.names[id];return name&&name!==`Item #${id}`?name:undefined;};
+   const watched=watch==='1'?new Set(state.watch):undefined;
+   const filtered=unsorted.filter(row=>{
+    const name=nameForId(row.itemId);
+    const itemId=String(row.itemId);
+    // An exact ID can still be found and queued for name resolution even when
+    // the UI normally hides unnamed items.
+    return (!watched||watched.has(row.itemId))&&(named!=='1'||!!name||itemId===search)&&(!search||!!name?.toLowerCase().includes(search)||itemId.includes(search));
+   });
+   const rows=sortOpportunities(filtered,sort,id=>nameForId(id)||`Item #${id}`);
    if(!demo){const ids=rows.slice(0,100).map(row=>row.itemId);nameResolver.enqueue(ids);metadataResolver.enqueue(ids);}
-   json(response,{rows:rows.slice(0,100),mode,at:snapshot?.at});
+   const visible=rows.slice(0,100).map(row=>{
+    if(requestedStrategy!=='monopolization'||!snapshot)return row;
+    const group=snapshot.items.get(row.itemId);
+    if(!group)return row;
+    let snapshotUnits=0;for(let i=group.start;i<group.start+group.length;i++)snapshotUnits+=group.quantities[i];
+    return {...row,monopoly:{snapshotUnits,plannedShare:snapshotUnits?row.quantity/snapshotUnits:0}};
+   });
+   json(response,{rows:visible,mode,at:snapshot?.at,strategy:requestedStrategy});
    return;
   }
   if(path==='/api/history'){

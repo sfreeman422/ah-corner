@@ -50,6 +50,15 @@ test('API sorts all opportunities before applying its 100-row limit',async()=>{
   assert.equal(byCost[0].itemId,700_001);
   const byName=await get('?sort=name&direction=asc');
   assert.equal(byName[0].itemId,700_120);
+  const explicit=await get('?strategy=monopolization');
+  assert.deepEqual(explicit,byScore,'default query remains the existing monopolization scan');
+  const flipping=await (await fetch(`${origin}/api/opportunities?strategy=flipping`)).json();
+  assert.equal(flipping.strategy,'flipping');
+  assert.ok(flipping.rows.length>0);
+  assert.ok(flipping.rows.every((row:{purchaseListings:number;flip:unknown;confidence:string})=>row.purchaseListings===1&&row.flip&&row.confidence==='watch'),'unknown item use remains watch-only');
+  const again=await (await fetch(`${origin}/api/opportunities?strategy=monopolization`)).json();
+  assert.ok(again.rows.every((row:{flip?:unknown;monopoly?:{plannedShare:number}})=>!row.flip&&row.monopoly?.plannedShare===.5),'strategy caches and listed supply share remain separate');
+  assert.equal((await fetch(`${origin}/api/opportunities?strategy=invalid`)).status,422);
   assert.equal((await fetch(`${origin}/api/opportunities?sort=unknown`)).status,422);
   assert.equal((await fetch(`${origin}/api/opportunities?direction=sideways`)).status,422);
  }finally{

@@ -114,6 +114,53 @@ export function scan(current:AnalysisSnapshot,history:AnalysisSnapshot[],setting
   }if(best)out.push(best);
  }return out.sort((a,b)=>Number(b.confidence==='candidate')-Number(a.confidence==='candidate')||b.score-a.score||b.profit-a.profit);
 }
+/** A flip buys one complete lowest-priced listing, leaving the rest of the
+ * market intact. Historical removals are a liquidity signal, not actual sales. */
+export function scanFlips(current:AnalysisSnapshot,history:AnalysisSnapshot[],settings:Settings=defaults):Opportunity[]{
+ const prior=history.filter(x=>x.market===current.market&&x.source===current.source&&x.at<current.at).sort((a,b)=>a.at-b.at).slice(-24);
+ const books=prior.map(compact),cur=compact(current),out:Opportunity[]=[];
+ const limit=Math.floor(settings.bankroll*settings.exposure);
+ for(const [itemId,group] of cur.items){
+  if(group.length<2)continue;
+  const rows=expandGroup(group,itemId);
+  if(new Set(rows.map(x=>x.kind)).size!==1)continue;
+  rows.sort((a,b)=>a.total/a.quantity-b.total/b.quantity||a.total-b.total||a.id.localeCompare(b.id));
+  const chosen=rows[0],cost=chosen.total,quantity=chosen.quantity;
+  if(cost>limit)continue;
+  const floors=books.map(book=>floorOf(book.items.get(itemId),itemId)).filter((v):v is number=>v!==undefined);
+  const historicalMedian=floors.length?quantile(floors,.5):null;
+  const remainingFloor=Math.ceil(rows[1].total/rows[1].quantity);
+  const target=Math.min(remainingFloor-1,historicalMedian??remainingFloor-1);
+  if(target<=0)continue;
+  const net=quantity*Math.floor(target*(1-settings.fee)),profit=net-cost,roi=profit/cost;
+  if(roi<settings.minROI||profit<settings.minProfit)continue;
+  const support=floors.length?floors.filter(price=>price>=target).length/floors.length:0;
+  let removed=0,replenished=0,intervals=0;
+  const timeline=[...books,cur],times=[...prior.map(s=>s.at),current.at];
+  for(let j=1;j<timeline.length;j++){
+   const hours=(times[j]-times[j-1])/3_600_000;
+   if(hours<.5||hours>3)continue;
+   const prev=timeline[j-1].items.get(itemId),next=timeline[j].items.get(itemId),n=new Map<string|number,number>(),p=new Map<string|number,number>();
+   if(next)for(let k=0;k<next.length;k++)n.set(groupId(next,k),k);
+   if(prev)for(let k=0;k<prev.length;k++)p.set(groupId(prev,k),k);
+   if(prev)for(let k=0;k<prev.length;k++){const pos=prev.start+k;if(prev.totals[pos]/prev.quantities[pos]<=target){const index=n.get(groupId(prev,k));removed+=Math.max(0,prev.quantities[pos]-(index===undefined?0:next!.quantities[next!.start+index]||0))/hours;}}
+   if(next)for(let k=0;k<next.length;k++){const pos=next.start+k;if(next.totals[pos]/next.quantities[pos]<target){const index=p.get(groupId(next,k));replenished+=Math.max(0,next.quantities[pos]-(index===undefined?0:prev!.quantities[prev!.start+index]||0))/hours;}}
+   intervals++;
+  }
+  const d=intervals?removed/intervals:null,r=intervals?replenished/intervals:null;
+  const observedRemovalsPerDay=d===null?null:d*24,enoughMovement=observedRemovalsPerDay===null?null:observedRemovalsPerDay>=quantity;
+  const fresh=current.source==='demo'||Date.now()-current.at<=2*3_600_000;
+  const supportPrice=quantile(floors,.75);
+  const confidence=floors.length>=settings.minHistory&&support>=.5&&target<=supportPrice&&d!==null&&d>0&&enoughMovement===true&&r!==null&&r<=d&&fresh?'candidate':'watch';
+  const checks={minimumHistory:settings.minHistory,minimumSupport:.5,priorFloor75thPercentile:floors.length?supportPrice:null,turnoverIntervals:intervals,historySufficient:floors.length>=settings.minHistory,supportSufficient:floors.length?support>=.5:null,targetSupported:floors.length?target<=supportPrice:null,removalObserved:d===null?null:d>0,replenishmentControlled:r===null||d===null?null:r<=d,fresh};
+  const tiersMap=new Map<number,{price:number;units:number;cost:number}>();
+  for(const listing of rows){const price=Math.ceil(listing.total/listing.quantity),tier=tiersMap.get(price)||{price,units:0,cost:0};tier.units+=listing.quantity;tier.cost+=listing.total;tiersMap.set(price,tier);}
+  const tiers=[...tiersMap.values()].sort((a,b)=>a.price-b.price).slice(0,20);
+  const score=Math.round(100*(.25*clamp((d??0)*24/quantity)+.25*clamp(roi/1.5)+.2*(1-cost/limit)+.15*(intervals?clamp(1-(r??0)/Math.max(1,d??0)):0)+.1*support+.05*(fresh?1:0)));
+  out.push({itemId,floor:Math.ceil(chosen.total/quantity),target,buyMax:Math.ceil(chosen.total/quantity),quantity,purchaseListings:1,cost,profit,roi,breakEvenUnits:Math.ceil(cost/Math.max(1,Math.floor(target*(1-settings.fee)))),score,historyCount:floors.length,support,replenish:r,removedUnits:d,confidence,checks,tiers,reasons:['Buys one complete listing, leaving competing supply in the market.','Listing removals may be cancellations or expirations, not sales; no sale time is guaranteed.'],flip:{historicalMedian,remainingFloor,observedRemovalsPerDay,enoughMovement,listingKind:chosen.kind}});
+ }
+ return out.sort((a,b)=>Number(b.confidence==='candidate')-Number(a.confidence==='candidate')||b.score-a.score||b.profit-a.profit);
+}
 export function historyFor(snapshots:Snapshot[],itemId:number){return snapshots.map(s=>stats(s.listings.filter(l=>l.itemId===itemId),s.at)).filter((s):s is Stats=>!!s).sort((a,b)=>a.at-b.at);}
 // No inferred sales. A forward test reports whether target remained available and how much competing supply appeared.
 export function backtest(snapshots:AnalysisSnapshot[],settings:Settings){const ss=[...snapshots].sort((a,b)=>a.at-b.at).slice(-48).map(compact);const results=[];for(let i=settings.minHistory;i<ss.length-1;i++){const s=ss[i],next=ss[i+1];if(next.at-s.at>3*3600000||s.market!==next.market||s.source!==next.source)continue;const o=scan(s,ss.slice(0,i),settings).filter(x=>x.historyCount>=settings.minHistory&&x.support>=.25).slice(0,3);for(const x of o){const future=expandGroup(next.items.get(x.itemId),x.itemId);const below=future.filter(l=>l.total/l.quantity<x.target).reduce((sum,l)=>sum+l.quantity,0);results.push({at:s.at,itemId:x.itemId,target:x.target,cost:x.cost,potentialProfit:x.profit,competingUnits:below,held:future.length>0&&below===0});}}return results;}

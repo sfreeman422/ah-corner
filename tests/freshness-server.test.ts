@@ -39,12 +39,19 @@ test('cached opportunities and addon plans become watch-only when the latest boo
   const before=(await rows()).find(row=>row.itemId===4402);
   assert.equal(before?.confidence,'candidate');
   assert.equal(before?.checks.fresh,true);
+  const flips=async()=>((await (await fetch(`${origin}/api/opportunities?strategy=flipping&roi=0`)).json()).rows as {itemId:number;confidence:string;checks:{fresh:boolean}}[]);
+  const beforeFlip=(await flips()).find(row=>row.itemId===4402);
+  assert.equal(beforeFlip?.confidence,'candidate');
+  assert.equal(beforeFlip?.checks.fresh,true);
   assert.match(await (await fetch(`${origin}/api/addon.lua`)).text(),/\{id=4402,/);
 
   await writeFile(join(dir,'clock-offset'),String(3*3_600_000));
   const after=(await rows()).find(row=>row.itemId===4402);
   assert.equal(after?.confidence,'watch');
   assert.equal(after?.checks.fresh,false);
+  const afterFlip=(await flips()).find(row=>row.itemId===4402);
+  assert.equal(afterFlip?.confidence,'watch');
+  assert.equal(afterFlip?.checks.fresh,false);
   const status=await (await fetch(`${origin}/api/status`)).json();
   assert.equal(status.stale,true);
   assert.doesNotMatch(await (await fetch(`${origin}/api/addon.lua`)).text(),/\{id=4402,/);

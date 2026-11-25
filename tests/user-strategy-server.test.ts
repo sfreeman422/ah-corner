@@ -66,6 +66,10 @@ test('authenticated strategies are isolated by Slack user and workspace and surv
   assert.deepEqual(await settings(otherTeam),legacy,'same Slack user ID in a different workspace must not share settings');
   assert.ok(!(await rows(alice)).some(row=>row.itemId===4402));
   assert.ok((await rows(bob)).some(row=>row.itemId===4402));
+  const flipRows=async(cookie:string)=>(await (await get(cookie,'/api/opportunities?strategy=flipping&roi=0')).json()).rows as {itemId:number;flip?:unknown}[];
+  assert.ok(!(await flipRows(alice)).some(row=>row.itemId===4402),'flip respects Alice’s smaller bankroll');
+  assert.ok((await flipRows(bob)).some(row=>row.itemId===4402&&row.flip),'flip scan uses Bob’s bankroll');
+  assert.ok(!(await flipRows(alice)).some(row=>row.itemId===4402),'cached Bob scan cannot leak into Alice’s results');
   assert.doesNotMatch(await (await get(alice,'/api/addon.lua')).text(),/\{id=4402,/);
   assert.match(await (await get(bob,'/api/addon.lua')).text(),/\{id=4402,/);
   assert.ok(!(await (await get(alice,'/api/backtest')).json()).some((row:{itemId:number})=>row.itemId===4402));
