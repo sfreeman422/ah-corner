@@ -201,7 +201,15 @@ async function updateRecipes(){
 function expireInMemorySnapshots(){
  const cutoff=Date.now()-liveDataRetentionMs;
  const retained=snapshots.filter(snapshot=>snapshot.source!=='blizzard'||(Number.isFinite(snapshot.at)&&snapshot.at>cutoff));
- if(retained.length!==snapshots.length){snapshots=retained;refresh();}
+ if(retained.length!==snapshots.length){snapshots=retained;refresh();return;}
+ // The cached scan is otherwise stable, but its freshness gate changes with
+ // the clock even if collection fails or no new book arrives. Re-scan once
+ // on that transition so status, explanations, and candidates agree.
+ const snapshot=latest();
+ if(snapshot){
+  const fresh=snapshot.source==='demo'||Date.now()-snapshot.at<=2*3_600_000;
+  if(cached.some(row=>row.checks.fresh!==fresh))refresh();
+ }
 }
 
 async function alerts(){

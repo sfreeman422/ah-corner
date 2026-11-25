@@ -2,7 +2,9 @@ import React,{useEffect,useRef,useState} from 'react';
 import {createRoot} from 'react-dom/client';
 import type {Alert,Opportunity,Settings,Stats,Trade} from '../src/types.ts';
 import type {ItemUseKind,ItemUseMap,RecipeUseMap} from '../src/item-use.ts';
+import {itemUseFor} from '../src/item-use.ts';
 import type {ItemNameDetails} from '../src/blizzard.ts';
+import {formatMoney as money,opportunityInsights} from '../src/insights.ts';
 import './style.css';
 
 type PublicProblem={code:string;message:string;action?:string};
@@ -41,12 +43,30 @@ async function api<T>(path:string,body?:unknown):Promise<T>{
  return payload as T;
 }
 
-const money=(c:number)=>`${(c/10_000).toFixed(2)}g`;
-const unit=(c:number)=>c>=10_000?`${(c/10_000).toFixed(4)}g`:`${(c/100).toFixed(2)}s`;
+const unit=(c:number)=>money(c);
 const pct=(n:number)=>`${Math.round(n*100)}%`;
 
 function ItemLink({id,name,source}:{id:number;name:string;source?:ItemNameDetails['source']}){
  return <><a href={`https://www.wowhead.com/forever/item=${id}`} target="_blank" rel="noopener noreferrer" onClick={event=>event.stopPropagation()}>{name}</a>{source&&source!=='forever'&&<small>{source==='classic-era'?'Classic Era':'Classic progression'} name · verify in Forever</small>}</>;
+}
+
+function HistoryChart({history,loading}:{history:Stats[];loading:boolean}){
+ if(loading)return <p className="muted">Loading observed prices…</p>;
+ if(!history.length)return <p className="muted">No saved price observations for this item yet.</p>;
+ const ordered=[...history].sort((a,b)=>a.at-b.at);
+ const first=ordered[0],last=ordered[ordered.length-1];
+ const low=Math.min(...ordered.map(value=>value.floor)),high=Math.max(...ordered.map(value=>value.floor));
+ const range=high-low;
+ const point=(value:Stats)=>({x:first.at===last.at?150:8+(value.at-first.at)/(last.at-first.at)*284,y:range?68-(value.floor-low)/range*56:40});
+ return <>
+  <div className="timeline-meta"><span>Low {unit(low)}</span><span>High {unit(high)}</span><span>Latest {unit(last.floor)}</span></div>
+  <svg viewBox="0 0 300 80" role="img" aria-label={`${ordered.length} observed floor prices, from ${unit(low)} to ${unit(high)} per unit`}>
+   <path d="M8 12H292 M8 68H292" stroke="#36454b"/>
+   {ordered.length===1?<circle cx={point(first).x} cy={point(first).y} r="3" fill="#76d2b4"/>:<polyline points={ordered.map(value=>{const p=point(value);return `${p.x},${p.y}`;}).join(' ')} fill="none" stroke="#76d2b4" strokeWidth="2.5"/>}
+  </svg>
+  <div className="timeline-meta"><span>{new Date(first.at).toLocaleString()}</span><span>{new Date(last.at).toLocaleString()}</span></div>
+  <p className="metric-explainer">{ordered.length} saved hourly observations, when available. The decision checks use recent distinct auction books, so their count can differ.</p>
+ </>;
 }
 
 type Collector={busy:boolean;lastChecked:number;lastSuccess:number;lastError:PublicProblem|null;nextScheduledAt:number|null};
@@ -64,9 +84,11 @@ function App({onLogout}:{onLogout?:()=>void}){
  const [fee,setFee]=useState(5);
  const [minHistory,setMinHistory]=useState(6);
  const strategyDirty=useRef(false);
+ const detailRef=useRef<HTMLElement>(null);
  const [tab,setTab]=useState('Scanner');
  const [id,setId]=useState<number>();
  const [history,setHistory]=useState<Stats[]>([]);
+ const [historyLoading,setHistoryLoading]=useState(false);
  const [portfolio,setPortfolio]=useState<{trades:Trade[];positions:Position[]}>({trades:[],positions:[]});
  const [alerts,setAlerts]=useState<Alert[]>([]);
  const [backtests,setBacktests]=useState<Backtest[]>([]);
@@ -81,9 +103,13 @@ function App({onLogout}:{onLogout?:()=>void}){
  const [form,setForm]=useState({side:'buy',itemId:'',quantity:'',total:'',fee:'0'});
  const resolvedName=(itemId:number)=>{const value=status?.names[itemId];return value&&value!==`Item #${itemId}`?value:undefined;};
  const name=(itemId:number)=>resolvedName(itemId)||`Item #${itemId} (name unavailable)`;
- const use=(itemId:number)=>status?.itemUses?.[itemId]||status?.recipeUses?.[itemId];
+ const use=(itemId:number)=>itemUseFor(status?.itemUses||{},itemId,status?.recipeUses||{});
  const filtered=rows.filter(row=>(showUnnamed||!!resolvedName(row.itemId))&&(!onlyWatch||status?.watch.includes(row.itemId))&&name(row.itemId).toLowerCase().includes(query.toLowerCase()));
  const active=filtered.find(row=>row.itemId===id)||filtered[0];
+ const selectOpportunity=(itemId:number)=>{
+  setId(itemId);
+  if(window.matchMedia('(max-width: 900px)').matches)detailRef.current?.scrollIntoView({behavior:'smooth',block:'start'});
+ };
 
  useEffect(()=>{
   if(!active)return;
@@ -126,8 +152,9 @@ function App({onLogout}:{onLogout?:()=>void}){
  useEffect(()=>{
   let live=true;
   if(active){
-   api<Stats[]>(`history?id=${active.itemId}`).then(value=>{if(live)setHistory(value);}).catch(cause=>setError(problemFrom(cause)));
-  }else setHistory([]);
+   setHistory([]);setHistoryLoading(true);
+   api<Stats[]>(`history?id=${active.itemId}`).then(value=>{if(live)setHistory(value);}).catch(cause=>{if(live)setError(problemFrom(cause));}).finally(()=>{if(live)setHistoryLoading(false);});
+  }else{setHistory([]);setHistoryLoading(false);}
   return()=>{live=false;};
  },[active?.itemId,status?.at]);
 
@@ -144,9 +171,10 @@ function App({onLogout}:{onLogout?:()=>void}){
   }catch(cause){setError(problemFrom(cause));}
  }
 
- const max=Math.max(1,...history.map(stat=>stat.floor));
  const sourceLabel=status?.mode==='demo'?'SIMULATED DATA':status?.stale?'STALE DATA':status?.collector.lastError?'REFRESH ISSUE':'LIVE SOURCE';
  const provisional=status?.mode==='live'&&!status.houseVerified;
+ const insights=active&&status?opportunityInsights(active,status.settings):undefined;
+ const activeUse=active?use(active.itemId):undefined;
 
  return <>
   <header>
@@ -164,9 +192,9 @@ function App({onLogout}:{onLogout?:()=>void}){
    {error&&<div className="banner bad" role="alert"><strong>{error.message}</strong>{error.action&&<span> {error.action}</span>}</div>}
    {notice&&<div className="banner" role="status">{notice} <button onClick={()=>setNotice('')}>Dismiss</button></div>}
    <section className="metrics">
-    <div><small>STRATEGY BANKROLL</small><strong>{status?money(status.settings.bankroll):'—'}</strong><label>Maximum exposure: {status?money(status.settings.bankroll*status.settings.exposure):'—'}</label></div>
-    <div><small>QUALIFYING BOOKS</small><strong>{rows.length}</strong><label>{rows.filter(row=>row.confidence==='candidate').length} historical candidates</label></div>
-    <div><small>SNAPSHOTS STORED</small><strong>{status?.snapshots??'—'}</strong><label>{status?.listingCount.toLocaleString()||'—'} priced listings</label></div>
+    <div><small>STRATEGY BANKROLL</small><strong>{status?money(status.settings.bankroll):'—'}</strong><label>Maximum exposure: {status?money(Math.floor(status.settings.bankroll*status.settings.exposure)):'—'}</label></div>
+    <div><small>OPPORTUNITIES SHOWN</small><strong>{rows.length}</strong><label>{rows.filter(row=>row.confidence==='candidate').length} candidates · up to 100 shown</label></div>
+    <div><small>RECENT BOOKS ANALYZED</small><strong>{status?.snapshots??'—'}</strong><label>{status?.listingCount.toLocaleString()||'—'} priced listings in latest book</label></div>
     <div><small>LAST SNAPSHOT</small><strong className="date">{status?.at?new Date(status.at).toLocaleTimeString([],{hour:'numeric',minute:'2-digit'}):'—'}</strong><label>{status?.at?new Date(status.at).toLocaleDateString():''}</label></div>
    </section>
    <nav>{['Scanner','Portfolio','Backtest','Alerts','Setup'].map(value=><button key={value} className={value===tab?'selected':''} onClick={()=>setTab(value)}>{value}</button>)}</nav>
@@ -204,24 +232,46 @@ function App({onLogout}:{onLogout?:()=>void}){
     </details>
     <div className="split">
      <section className="panel">
-      <h3>Opportunity queue <span>{filtered.length}</span></h3>
-      <div className="scroll"><table><thead><tr><th>Item / confidence</th><th>Buyout</th><th>Potential profit</th><th>ROI</th><th>Score</th></tr></thead><tbody>{filtered.map(row=><tr key={row.itemId} onClick={()=>setId(row.itemId)} className={active?.itemId===row.itemId?'chosen':''}><td><ItemLink id={row.itemId} name={name(row.itemId)} source={status?.nameSources?.[row.itemId]}/> <button className="link" onClick={()=>setId(row.itemId)} aria-label={`View details for ${name(row.itemId)}`}>Details</button><small className={row.confidence==='candidate'?'green':'muted'}>{row.confidence} · {use(row.itemId)?.kind||'use unknown'}</small></td><td>{money(row.cost)}</td><td className="green">+{money(row.profit)}</td><td>{pct(row.roi)}</td><td>{row.score}</td></tr>)}</tbody></table>{!filtered.length&&<p className="empty">No named opportunities match your filters yet. Names may still be loading; use “Include items without names” to inspect missing names.</p>}</div>
+      <div className="queue-heading"><div><h3>Opportunity queue <span>{filtered.length}</span></h3><p className="metric-explainer">Select Details to see the plan and its risks. Profit assumes every purchased unit sells at the target.</p></div></div>
+      <div className="scroll"><table><thead><tr><th>Item / confidence</th><th>Buyout</th><th>Potential profit</th><th>ROI</th><th>Score</th></tr></thead><tbody>{filtered.map(row=><tr key={row.itemId} onClick={()=>selectOpportunity(row.itemId)} className={active?.itemId===row.itemId?'chosen':''}><td><ItemLink id={row.itemId} name={name(row.itemId)} source={status?.nameSources?.[row.itemId]}/> <button className="link" onClick={event=>{event.stopPropagation();selectOpportunity(row.itemId);}} aria-label={`View details for ${name(row.itemId)}`}>Details</button><small className={row.confidence==='candidate'?'green':'muted'}>{row.confidence} · {use(row.itemId)?.kind||'use unknown'}</small></td><td>{money(row.cost)}</td><td className="green">+{money(row.profit)}</td><td>{pct(row.roi)}</td><td>{row.score}</td></tr>)}</tbody></table>{!filtered.length&&<p className="empty">No named opportunities match your filters yet. Names may still be loading; use “Include items without names” to inspect missing names.</p>}</div>
      </section>
-     <section className="panel detail">
-      {active?<>
+     <section className="panel detail" ref={detailRef}>
+      {active&&insights&&status?<>
        <div className="between"><h3><ItemLink id={active.itemId} name={name(active.itemId)} source={status?.nameSources?.[active.itemId]}/></h3><button onClick={()=>action(()=>api('watch',{itemId:active.itemId}),'Watchlist updated.')}>{status?.watch.includes(active.itemId)?'★ Watching':'☆ Watch'}</button></div>
-       <div className="three"><div><small>BUY UNITS</small><strong>{active.quantity}</strong></div><div><small>TARGET / UNIT</small><strong>{unit(active.target)}</strong></div><div><small>BREAK-EVEN UNITS</small><strong>{active.breakEvenUnits}</strong></div></div>
-       <p><strong>{active.purchaseListings} listings in buyout</strong> · potential profit {money(active.profit)} ({money(active.profit/Math.max(1,active.purchaseListings))} per listed auction). This is not gold per hour or a prediction of sales.</p>
-       {active.reasons.map(reason=><p className="muted" key={reason}>{reason}</p>)}
-       {use(active.itemId)?.source==='warcraftforever-recipe'&&<p><a href={`https://warcraftforever.com/spells/${status?.recipeUses?.[active.itemId]?.recipeId}`} target="_blank" rel="noopener noreferrer">View recipe at Warcraft Forever</a></p>}
-       <h4>Order book · lowest tiers</h4>
-       <div className="depth">{active.tiers.map(tier=><div className="tier" key={tier.price}><span>{unit(tier.price)}</span><div className="bar"><i className={tier.price<=active.buyMax?'buy':''} style={{width:`${tier.units/Math.max(...active.tiers.map(value=>value.units))*100}%`}}/></div><span>{tier.units}</span></div>)}</div>
-       <small>Amber = acquisition tier; green = remaining competition. Max acquisition tier: {unit(active.buyMax)} per unit. Stack buyout total: {money(active.cost)}.</small>
-       <h4>Observed floor history</h4>
-       {history.length?<svg viewBox="0 0 300 80" role="img" aria-label="Historical floor price chart"><path d="M0 75H300 M0 5H300" stroke="#36454b"/><polyline points={history.map((stat,index)=>`${index*300/Math.max(1,history.length-1)},${75-stat.floor/max*70}`).join(' ')} fill="none" stroke="#67c7ad" strokeWidth="2.5"/></svg>:<p>No history yet.</p>}
-       <div className="three"><div><small>PRICE SUPPORT</small><strong>{pct(active.support)}</strong></div><div><small>REMOVED / HR*</small><strong>{active.removedUnits?.toFixed(1)??'—'}</strong></div><div><small>NEW / HR*</small><strong>{active.replenish?.toFixed(1)??'—'}</strong></div></div>
-       <p className="muted">* Auction disappearance is not a sale. {active.historyCount} prior observations. Profit excludes failed deposits; verify exact in-game listings.</p>
-       <button onClick={()=>{if(!navigator.clipboard){setError({code:'CLIPBOARD_UNAVAILABLE',message:'Clipboard access is unavailable in this browser.',action:'Copy the item name manually.'});return;}void navigator.clipboard.writeText(name(active.itemId)).then(()=>setNotice('Item name copied.')).catch(()=>setError({code:'CLIPBOARD_UNAVAILABLE',message:'Clipboard access was blocked.',action:'Copy the item name manually.'}));}}>Copy item name</button> {provisional?<button disabled title="Verify the auction house before exporting a plan">Export plan</button>:<a className="button" href="/api/addon.lua" download="Plan.lua">Export plan</a>}
+       <div className={`decision-summary ${active.confidence}`}>
+        <small className="detail-kicker">Decision</small>
+        <strong>{active.confidence==='candidate'?'Candidate · verify in game':provisional?'Watch only · auction house unverified':!activeUse?'Watch only · item use unconfirmed':'Watch only · review the checks below'}</strong>
+        <p>{active.confidence==='candidate'?'The current model checks passed. Confirm the listings and player demand before buying.':'This is a hypothetical reset to research, not a recommendation to buy.'}</p>
+       </div>
+       <section className="insight-section">
+        <h4>What the plan would require</h4>
+        <p className="metric-explainer">Buy the lowest listed tiers, then try to relist at the target. Regular auctions must be purchased in full stacks.</p>
+        <div className="plan-grid">
+         <div className="plan-card"><small>BUYOUT COST</small><strong>{money(active.cost)}</strong><small>{active.quantity.toLocaleString()} units across {active.purchaseListings.toLocaleString()} listings</small></div>
+         <div className="plan-card"><small>CAPITAL AT RISK</small><strong>{pct(insights.capitalFraction)} of bankroll</strong><small>{money(insights.exposureLimit)} per-item exposure limit</small></div>
+         <div className="plan-card"><small>HIGHEST BUY PRICE</small><strong>{unit(active.buyMax)} / unit</strong><small>Approx. {unit(insights.averageCostPerUnit)} average per unit</small></div>
+         <div className="plan-card"><small>PROPOSED RESELL PRICE</small><strong>{unit(active.target)} / unit</strong><small>One copper below the next listed tier</small></div>
+         <div className="plan-card"><small>POTENTIAL PROFIT</small><strong>{money(active.profit)}</strong><small>{pct(active.roi)} return if all units sell at target</small></div>
+         <div className="plan-card"><small>BREAK EVEN AT TARGET</small><strong>{active.breakEvenUnits.toLocaleString()} of {active.quantity.toLocaleString()} units</strong><small>Assumes the configured AH fee</small></div>
+        </div>
+        <p className="plan-note">If every unit sells at the target: {money(insights.grossRevenue)} gross, about {money(insights.feeAmount)} in AH fees, and {money(insights.netRevenue)} after fees. Profit excludes deposits, reposts and price changes; sales are not guaranteed.</p>
+       </section>
+       <section className="insight-section">
+        <h4>Why this is {active.confidence==='candidate'?'a candidate':'watch only'}</h4>
+        <ul className="check-list">
+         <li className={`check-row ${provisional?'warning':'pass'}`}><span className="check-icon" aria-hidden="true">{provisional?'!':'✓'}</span><div className="check-copy"><strong>Auction house · {provisional?'unverified':status.mode==='demo'?'demo':'verified'}</strong><small>{provisional?'Compare prices with your in-game US PvP Horde auction house before relying on this market.':status.mode==='demo'?'Synthetic data for testing only.':'The selected auction house has been marked verified.'}</small></div></li>
+         <li className={`check-row ${activeUse?'pass':'unknown'}`}><span className="check-icon" aria-hidden="true">{activeUse?'✓':'?'}</span><div className="check-copy"><strong>Item use · {activeUse?activeUse.kind:'unknown'}</strong><small>{activeUse?`${activeUse.source==='player'?'Player research':'Recipe evidence'}: ${activeUse.note}. A use does not prove demand or sales.`:'No quest, recipe or other use has been recorded. Research the item before trading.'}</small>{activeUse?.source==='warcraftforever-recipe'&&<a href={`https://warcraftforever.com/spells/${activeUse.recipeId}`} target="_blank" rel="noopener noreferrer">View source recipe</a>}</div></li>
+         {insights.checks.map(check=><li className={`check-row ${check.status==='caution'?'warning':check.status}`} key={check.key}><span className="check-icon" aria-hidden="true">{check.status==='pass'?'✓':check.status==='caution'?'!':'?'}</span><div className="check-copy"><strong>{check.label} · {check.status==='pass'?'meets model check':check.status==='caution'?'needs attention':'not enough data'}</strong><small>{check.detail}</small></div></li>)}
+        </ul>
+        <p className="metric-explainer">Score {active.score}/100 is a ranking heuristic, not a probability or an estimate of sales. Removed listings may have sold, expired, or been cancelled.</p>
+       </section>
+       <section className="insight-section">
+        <h4>Order book · up to 20 lowest price tiers</h4>
+        <div className="depth">{active.tiers.map(tier=><div className="tier" key={tier.price}><span>{unit(tier.price)}</span><div className="bar"><i className={tier.price<=active.buyMax?'buy':''} style={{width:`${tier.units/Math.max(...active.tiers.map(value=>value.units))*100}%`}}/></div><span>{tier.units}</span></div>)}</div>
+        <p className="metric-explainer">Amber tiers are included in this buyout; green tiers are remaining listings. Bar length represents units at each price.</p>
+       </section>
+       <section className="insight-section"><h4>Observed floor history · per unit</h4><HistoryChart history={history} loading={historyLoading}/></section>
+       <div className="detail-actions"><button onClick={()=>{if(!navigator.clipboard){setError({code:'CLIPBOARD_UNAVAILABLE',message:'Clipboard access is unavailable in this browser.',action:'Copy the item name manually.'});return;}void navigator.clipboard.writeText(name(active.itemId)).then(()=>setNotice('Item name copied.')).catch(()=>setError({code:'CLIPBOARD_UNAVAILABLE',message:'Clipboard access was blocked.',action:'Copy the item name manually.'}));}}>Copy item name</button> {provisional?<button disabled title="Verify the auction house before exporting a plan">Export plan</button>:<a className="button" href="/api/addon.lua" download="Plan.lua">Export plan</a>}</div>
       </>:<p>Select an item when opportunities are available.</p>}
      </section>
     </div>

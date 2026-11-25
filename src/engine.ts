@@ -40,8 +40,11 @@ export function scan(current:Snapshot,history:Snapshot[],settings:Settings=defau
    const r=intervals?replenished/intervals:null, d=intervals?removed/intervals:null;
    const fresh=current.source==='demo'||Date.now()-current.at<=2*3600000;
    const confidence=hs.length>=settings.minHistory&&support>=.25&&target<=supportPrice&&d!==null&&d>0&&r!==null&&r<=d&&fresh?'candidate':'watch';
+   // Preserve missing evidence as null: no observations is different from a
+   // measured zero, and these checks use the same raw-book window as the scan.
+   const checks={minimumHistory:settings.minHistory,minimumSupport:.25,priorFloor75thPercentile:hs.length?supportPrice:null,turnoverIntervals:intervals,historySufficient:hs.length>=settings.minHistory,supportSufficient:hs.length?support>=.25:null,targetSupported:hs.length?target<=supportPrice:null,removalObserved:d===null?null:d>0,replenishmentControlled:r===null||d===null?null:r<=d,fresh};
    const score=Math.round(100*(.25*clamp((d??0)/quantity)+.25*clamp(roi/1.5)+.20*(1-cost/(settings.bankroll*settings.exposure))+.15*(intervals?clamp(1-(r??0)/Math.max(1,d??0)):0)+.10*support+.05*(fresh?1:0)));
-   const o:Opportunity={itemId,floor:tiers[0].price,target,buyMax:tiers[i].price,quantity,purchaseListings,cost,profit,roi,breakEvenUnits:Math.ceil(cost/Math.max(1,Math.floor(target*(1-settings.fee)))),score,historyCount:hs.length,support,replenish:r,removedUnits:d,confidence,tiers:tiers.slice(0,20),reasons:[confidence==='candidate'?'Historical price support and observed supply turnover':'Insufficient support, turnover, or freshness', 'Removed units are NOT verified sales','Buy entire regular auctions; verify live depth and deposits']};
+   const o:Opportunity={itemId,floor:tiers[0].price,target,buyMax:tiers[i].price,quantity,purchaseListings,cost,profit,roi,breakEvenUnits:Math.ceil(cost/Math.max(1,Math.floor(target*(1-settings.fee)))),score,historyCount:hs.length,support,replenish:r,removedUnits:d,confidence,checks,tiers:tiers.slice(0,20),reasons:[confidence==='candidate'?'Historical price support and observed supply turnover':'Insufficient support, turnover, or freshness', 'Removed units are NOT verified sales','Buy entire regular auctions; verify live depth and deposits']};
    if(!best||(o.confidence==='candidate'&&best.confidence==='watch')||(o.confidence===best.confidence&&o.score>best.score))best=o;
   }if(best)out.push(best);
  }return out.sort((a,b)=>Number(b.confidence==='candidate')-Number(a.confidence==='candidate')||b.score-a.score||b.profit-a.profit);
