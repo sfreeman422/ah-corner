@@ -5,10 +5,10 @@ import type {IncomingMessage, ServerResponse} from 'node:http';
 import {extname, resolve} from 'node:path';
 import {Blizzard} from './blizzard.ts';
 import {demoSnapshots, names} from './demo.ts';
-import {backtest, portfolio, scan, validInt} from './engine.ts';
+import {backtest, compactSnapshot, portfolio, scan, validInt} from './engine.ts';
 import {parseJournal, validateTrade} from './journal.ts';
 import {openStore} from './store.ts';
-import type {Alert, Opportunity, Settings} from './types.ts';
+import type {Alert, CompactSnapshot, Opportunity, Settings} from './types.ts';
 import {Sessions} from './auth.ts';
 import {applyItemUse,itemUseFor,validateItemUse} from './item-use.ts';
 import {ItemNameResolver} from './item-names.ts';
@@ -129,7 +129,18 @@ function expireLiveState(){
  return changed;
 }
 if(expireLiveState())await store.save(state);
-let snapshots=await store.snapshots();
+async function loadSnapshots():Promise<CompactSnapshot[]>{
+ const result:CompactSnapshot[]=[];
+ for await(const snapshot of store.iterSnapshots()){
+  result.push(compactSnapshot(snapshot));
+  // The previous parsed book is no longer needed. Keep startup peak memory
+  // bounded even when V8 would otherwise retain several large dead books.
+  global.gc?.();
+ }
+ global.gc?.();
+ return result;
+}
+let snapshots=await loadSnapshots();
 let busy=false;
 let lastChecked=0;
 let lastSuccess=0;
@@ -273,17 +284,21 @@ async function collect(){
   if(demo){
    if(!snapshots.length||Date.now()-(latest()?.at||0)>=3_600_000){
     for(const snapshot of demoSnapshots())await store.put(snapshot);
-    snapshots=await store.snapshots();
+    snapshots=await loadSnapshots();
    }
    Object.assign(state.names,names);
   }else{
    const result=await blizzard.snapshot(house,state.modified);
    if(result.snapshot){
     await store.put(result.snapshot);
+    const packed=compactSnapshot(result.snapshot);
+    // Release the large raw book before rescanning the retained history.
+    result.snapshot=null;
+    global.gc?.();
     // A complete unchanged book is a fresh observation too; replace the
     // in-memory copy so freshness checks do not expire unchanged prices.
-    snapshots=snapshots.filter(snapshot=>snapshot.key!==result.snapshot!.key);
-    snapshots.push(result.snapshot);
+    snapshots=snapshots.filter(snapshot=>snapshot.key!==packed.key);
+    snapshots.push(packed);
     snapshots.sort((a,b)=>a.at-b.at);
     snapshots=snapshots.slice(-25);
    }
@@ -428,7 +443,7 @@ const server=createServer(async(request,response)=>{
    if(expireLiveState())await save();
    if(!demo)nameResolver.enqueue([...state.watch,...state.trades.map(trade=>trade.itemId),...state.alerts.map(alert=>alert.itemId)]);
    const snapshot=latest();
-   json(response,{mode,market,houseVerified,at:snapshot?.at||null,listingCount:snapshot?.listings.length||0,snapshots:snapshots.length,collector:{busy,lastChecked,lastSuccess,lastError:lastCollectionError||null,nextScheduledAt:collectSchedule==='interval'&&lastChecked?lastChecked+pollMinutes*60_000:null},settings:userSettings,watch:state.watch,names:state.names,nameSources:state.nameSources||{},itemUses:state.itemUses||{},recipeUses:state.recipeUses||{},recipeIndex:state.recipeIndex||null,recipeLookup:{busy:recipeBusy,error:recipeError},stale:!snapshot||Date.now()-snapshot.at>7_200_000});
+   json(response,{mode,market,houseVerified,at:snapshot?.at||null,listingCount:snapshot?.listingCount||0,snapshots:snapshots.length,collector:{busy,lastChecked,lastSuccess,lastError:lastCollectionError||null,nextScheduledAt:collectSchedule==='interval'&&lastChecked?lastChecked+pollMinutes*60_000:null},settings:userSettings,watch:state.watch,names:state.names,nameSources:state.nameSources||{},itemUses:state.itemUses||{},recipeUses:state.recipeUses||{},recipeIndex:state.recipeIndex||null,recipeLookup:{busy:recipeBusy,error:recipeError},stale:!snapshot||Date.now()-snapshot.at>7_200_000});
    return;
   }
   if(path==='/api/settings'){

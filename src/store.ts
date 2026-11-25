@@ -11,6 +11,8 @@ export type Store={
  load:()=>Promise<State>;
  save:(s:State)=>Promise<void>;
  snapshots:()=>Promise<Snapshot[]>;
+ iterSnapshots:()=>AsyncGenerator<Snapshot>;
+ getSnapshot:(key:string)=>Promise<Snapshot|null>;
  put:(s:Snapshot)=>Promise<boolean>;
  history:(itemId:number)=>Promise<Stats[]>;
  prune:()=>Promise<void>;
@@ -141,6 +143,20 @@ async function trimSnapshots(pool:Pool,market:string){
  if(rows.length===1000)await trimSnapshots(pool,market);
 }
 
+// Query only small metadata first, then read and parse one complete book at a
+// time. The caller can compact each yielded book before requesting the next.
+export async function* iterateMysqlSnapshots(database:Database,market:string):AsyncGenerator<Snapshot>{
+ const rows=await execute<RowDataPacket[]>(database,`SELECT snapshot_key FROM ${snapshotsTable} WHERE market=? ORDER BY recorded_at DESC,snapshot_key DESC LIMIT 25`,[market]);
+ for(const row of rows.reverse()){
+  const current=await execute<RowDataPacket[]>(database,`SELECT data FROM ${snapshotsTable} WHERE market=? AND snapshot_key=?`,[market,String(row.snapshot_key)]);
+  if(!current[0])throw Error('A stored snapshot disappeared while loading history. Retry the request.');
+  const snapshot=parseJson<Snapshot>(current[0].data);
+  // Do not retain the potentially large JSON string while the caller uses the book.
+  current.length=0;
+  yield snapshot;
+ }
+}
+
 // A snapshot and all its compact history rows are committed together. A failed
 // batch rolls back the raw book as well, allowing the collector to retry it.
 export async function saveSnapshotTransaction(pool:Pick<Pool,'getConnection'>,market:string,snapshot:Snapshot):Promise<boolean>{
@@ -229,9 +245,11 @@ export async function openStore(market:string):Promise<Store>{
     const data=JSON.stringify(state);
     await execute<ResultSetHeader>(pool,`INSERT INTO ${stateTable}(market,data) VALUES(?,?) ON DUPLICATE KEY UPDATE data=?`,[market,data,data]);
    },
-   async snapshots(){
-    const rows=await execute<RowDataPacket[]>(pool,`SELECT data FROM ${snapshotsTable} WHERE market=? ORDER BY recorded_at DESC LIMIT 25`,[market]);
-    return rows.map(row=>parseJson<Snapshot>(row.data)).reverse();
+   async *iterSnapshots(){yield* iterateMysqlSnapshots(pool,market);},
+   async snapshots(){const result:Snapshot[]=[];for await(const snapshot of iterateMysqlSnapshots(pool,market))result.push(snapshot);return result;},
+   async getSnapshot(key){
+    const rows=await execute<RowDataPacket[]>(pool,`SELECT data FROM ${snapshotsTable} WHERE market=? AND snapshot_key=?`,[market,key]);
+    return rows[0]?parseJson<Snapshot>(rows[0].data):null;
    },
    async put(snapshot){
     const inserted=await saveSnapshotTransaction(pool,market,snapshot);
@@ -272,10 +290,22 @@ export async function openStore(market:string):Promise<Store>{
   const files=(await readdir(dir)).filter(file=>file.startsWith('history-')&&file.endsWith('.json'));
   return Promise.all(files.map(async file=>({file,entry:JSON.parse(await readFile(join(dir,file),'utf8')) as HistorySnapshot})));
  }
+ async function* iterateFileSnapshots():AsyncGenerator<Snapshot>{
+  const files=(await readdir(dir)).filter(file=>file.startsWith('snap-')&&file.endsWith('.json')).sort().slice(-25);
+  for(const file of files)yield JSON.parse(await readFile(join(dir,file),'utf8')) as Snapshot;
+ }
  return {
   async load(){try{return JSON.parse(await readFile(state,'utf8'));}catch(error){if((error as NodeJS.ErrnoException).code==='ENOENT')return empty();throw error;}},
   async save(nextState){await atomic(state,nextState);},
-  async snapshots(){const files=(await readdir(dir)).filter(file=>file.startsWith('snap-')&&file.endsWith('.json')).sort();return Promise.all(files.slice(-25).map(async file=>JSON.parse(await readFile(join(dir,file),'utf8'))));},
+  async *iterSnapshots(){yield* iterateFileSnapshots();},
+  async snapshots(){const result:Snapshot[]=[];for await(const snapshot of iterateFileSnapshots())result.push(snapshot);return result;},
+  async getSnapshot(key){
+   const encoded=key.replace(/[^a-zA-Z0-9-]/g,'_');
+   const files=(await readdir(dir)).filter(file=>/^snap-\d+-/.test(file)&&file.endsWith('.json')&&file.replace(/^snap-\d+-/,'').slice(0,-5)===encoded).sort();
+   if(!files.length)return null;
+   try{const snapshot=JSON.parse(await readFile(join(dir,files.at(-1)!), 'utf8')) as Snapshot;return snapshot.key===key?snapshot:null;}
+   catch(error){if((error as NodeJS.ErrnoException).code==='ENOENT')return null;throw error;}
+  },
   async put(snapshot){
    if(snapshot.market!==market)throw Error('Snapshot market does not match store market');
    const key=snapshot.key.replace(/[^a-zA-Z0-9-]/g,'_');

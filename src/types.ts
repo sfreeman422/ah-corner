@@ -1,5 +1,10 @@
 export type Listing={id:string;itemId:number;quantity:number;total:number;kind:'auction'|'commodity';timeLeft:string};
 export type Snapshot={key:string;at:number;source:'demo'|'blizzard';market:string;listings:Listing[]};
+// In-memory analysis representation. Raw books are retained in the store.
+// Numeric IDs are used only when converting back reproduces the original ID;
+// arbitrary fixture IDs live in opaqueIds instead.
+export type CompactGroup={ids:Float64Array;quantities:Float64Array;totals:Float64Array;kinds:Uint8Array;start:number;length:number;opaqueIds?:Map<number,string>};
+export type CompactSnapshot={representation:'compact';key:string;at:number;source:'demo'|'blizzard';market:string;listingCount:number;items:Map<number,CompactGroup>};
 export type Stats={at:number;floor:number;units:number;listings:number;median:number};
 export type Settings={bankroll:number;exposure:number;minROI:number;minProfit:number;fee:number;minHistory:number};
 export type Trade={id:string;itemId:number;side:'buy'|'sell';quantity:number;total:number;fee:number;at:number;note:string};
