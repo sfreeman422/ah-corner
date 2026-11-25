@@ -5,6 +5,8 @@ import type {ItemUseKind,ItemUseMap,RecipeUseMap} from '../src/item-use.ts';
 import {itemUseFor} from '../src/item-use.ts';
 import type {ItemNameDetails} from '../src/blizzard.ts';
 import {formatMoney as money,opportunityInsights} from '../src/insights.ts';
+import {defaultOpportunitySort,nextOpportunitySort,sortOpportunities} from '../src/opportunity-sort.ts';
+import type {OpportunitySort,OpportunitySortKey} from '../src/opportunity-sort.ts';
 import './style.css';
 
 type PublicProblem={code:string;message:string;action?:string};
@@ -50,6 +52,11 @@ function ItemLink({id,name,source}:{id:number;name:string;source?:ItemNameDetail
  return <><a href={`https://www.wowhead.com/forever/item=${id}`} target="_blank" rel="noopener noreferrer" onClick={event=>event.stopPropagation()}>{name}</a>{source&&source!=='forever'&&<small>{source==='classic-era'?'Classic Era':'Classic progression'} name · verify in Forever</small>}</>;
 }
 
+function SortHeader({label,column,sort,onSort}:{label:string;column:OpportunitySortKey;sort:OpportunitySort;onSort:(key:OpportunitySortKey)=>void}){
+ const active=sort.key===column;
+ return <th scope="col" aria-sort={active?(sort.direction==='asc'?'ascending':'descending'):undefined}><button type="button" className={`sort-header${active?' active':''}`} onClick={()=>onSort(column)}>{label}<span aria-hidden="true">{active?(sort.direction==='asc'?' ▲':' ▼'):' ↕'}</span></button></th>;
+}
+
 function HistoryChart({history,loading}:{history:Stats[];loading:boolean}){
  if(loading)return <p className="muted">Loading observed prices…</p>;
  if(!history.length)return <p className="muted">No saved price observations for this item yet.</p>;
@@ -77,6 +84,9 @@ type Backtest={at:number;itemId:number;target:number;cost:number;potentialProfit
 function App({onLogout}:{onLogout?:()=>void}){
  const [status,setStatus]=useState<Status>();
  const [rows,setRows]=useState<Opportunity[]>([]);
+ const [sort,setSort]=useState<OpportunitySort>(defaultOpportunitySort);
+ const sortRef=useRef(sort);
+ sortRef.current=sort;
  const [bank,setBank]=useState(35);
  const [roi,setRoi]=useState(30);
  const [exposure,setExposure]=useState(35);
@@ -104,8 +114,14 @@ function App({onLogout}:{onLogout?:()=>void}){
  const resolvedName=(itemId:number)=>{const value=status?.names[itemId];return value&&value!==`Item #${itemId}`?value:undefined;};
  const name=(itemId:number)=>resolvedName(itemId)||`Item #${itemId} (name unavailable)`;
  const use=(itemId:number)=>itemUseFor(status?.itemUses||{},itemId,status?.recipeUses||{});
- const filtered=rows.filter(row=>(showUnnamed||!!resolvedName(row.itemId))&&(!onlyWatch||status?.watch.includes(row.itemId))&&name(row.itemId).toLowerCase().includes(query.toLowerCase()));
+ const filtered=sortOpportunities(rows.filter(row=>(showUnnamed||!!resolvedName(row.itemId))&&(!onlyWatch||status?.watch.includes(row.itemId))&&name(row.itemId).toLowerCase().includes(query.toLowerCase())),sort,name);
  const active=filtered.find(row=>row.itemId===id)||filtered[0];
+ const changeSort=(key:OpportunitySortKey)=>{
+  if(active)setId(active.itemId);
+  const next=nextOpportunitySort(sortRef.current,key);
+  sortRef.current=next;
+  setSort(next);
+ };
  const selectOpportunity=(itemId:number)=>{
   setId(itemId);
   if(window.matchMedia('(max-width: 900px)').matches)detailRef.current?.scrollIntoView({behavior:'smooth',block:'start'});
@@ -119,14 +135,15 @@ function App({onLogout}:{onLogout?:()=>void}){
   setResearchNote(evidence?.note||'');
  },[active?.itemId,status?.market]);
 
- async function load(){
+ async function load(requestedSort=sortRef.current){
   try{
    const [nextStatus,opportunities,nextAlerts,nextPortfolio]=await Promise.all([
     api<Status>('status'),
-    api<{rows:Opportunity[]}>('opportunities'),
+    api<{rows:Opportunity[]}>(`opportunities?sort=${requestedSort.key}&direction=${requestedSort.direction}`),
     api<Alert[]>('alerts'),
     api<typeof portfolio>('portfolio')
    ]);
+   if(sortRef.current.key!==requestedSort.key||sortRef.current.direction!==requestedSort.direction)return;
    setStatus(nextStatus);
    if(!strategyDirty.current){
     setBank(nextStatus.settings.bankroll/10_000);
@@ -140,14 +157,14 @@ function App({onLogout}:{onLogout?:()=>void}){
    setAlerts(nextAlerts);
    setPortfolio(nextPortfolio);
    setError(undefined);
-  }catch(cause){setError(problemFrom(cause));}
+  }catch(cause){if(sortRef.current.key===requestedSort.key&&sortRef.current.direction===requestedSort.direction)setError(problemFrom(cause));}
  }
 
  useEffect(()=>{
   void load();
   const timer=setInterval(()=>void load(),30_000);
   return()=>clearInterval(timer);
- },[]);
+ },[sort.key,sort.direction]);
 
  useEffect(()=>{
   let live=true;
@@ -232,8 +249,8 @@ function App({onLogout}:{onLogout?:()=>void}){
     </details>
     <div className="split">
      <section className="panel">
-      <div className="queue-heading"><div><h3>Opportunity queue <span>{filtered.length}</span></h3><p className="metric-explainer">Select Details to see the plan and its risks. Profit assumes every purchased unit sells at the target.</p></div></div>
-      <div className="scroll"><table><thead><tr><th>Item / confidence</th><th>Buyout</th><th>Potential profit</th><th>ROI</th><th>Score</th></tr></thead><tbody>{filtered.map(row=><tr key={row.itemId} onClick={()=>selectOpportunity(row.itemId)} className={active?.itemId===row.itemId?'chosen':''}><td><ItemLink id={row.itemId} name={name(row.itemId)} source={status?.nameSources?.[row.itemId]}/> <button className="link" onClick={event=>{event.stopPropagation();selectOpportunity(row.itemId);}} aria-label={`View details for ${name(row.itemId)}`}>Details</button><small className={row.confidence==='candidate'?'green':'muted'}>{row.confidence} · {use(row.itemId)?.kind||'use unknown'}</small></td><td>{money(row.cost)}</td><td className="green">+{money(row.profit)}</td><td>{pct(row.roi)}</td><td>{row.score}</td></tr>)}</tbody></table>{!filtered.length&&<p className="empty">No named opportunities match your filters yet. Names may still be loading; use “Include items without names” to inspect missing names.</p>}</div>
+      <div className="queue-heading"><div><h3>Opportunity queue <span>{filtered.length}</span></h3><p className="metric-explainer">Select a column heading to sort; search and watchlist filters apply to the first 100 results. Profit assumes every purchased unit sells at the target.</p></div></div>
+      <div className="scroll"><table><thead><tr><SortHeader label="Item / confidence" column="name" sort={sort} onSort={changeSort}/><SortHeader label="Buyout" column="cost" sort={sort} onSort={changeSort}/><SortHeader label="Potential profit" column="profit" sort={sort} onSort={changeSort}/><SortHeader label="ROI" column="roi" sort={sort} onSort={changeSort}/><SortHeader label="Score" column="score" sort={sort} onSort={changeSort}/></tr></thead><tbody>{filtered.map(row=><tr key={row.itemId} onClick={()=>selectOpportunity(row.itemId)} className={active?.itemId===row.itemId?'chosen':''}><td><ItemLink id={row.itemId} name={name(row.itemId)} source={status?.nameSources?.[row.itemId]}/> <button className="link" onClick={event=>{event.stopPropagation();selectOpportunity(row.itemId);}} aria-label={`View details for ${name(row.itemId)}`}>Details</button><small className={row.confidence==='candidate'?'green':'muted'}>{row.confidence} · {use(row.itemId)?.kind||'use unknown'}</small></td><td>{money(row.cost)}</td><td className="green">+{money(row.profit)}</td><td>{pct(row.roi)}</td><td>{row.score}</td></tr>)}</tbody></table>{!filtered.length&&<p className="empty">No named opportunities match your filters yet. Names may still be loading; use “Include items without names” to inspect missing names.</p>}</div>
      </section>
      <section className="panel detail" ref={detailRef}>
       {active&&insights&&status?<>

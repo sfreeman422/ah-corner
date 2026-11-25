@@ -14,6 +14,8 @@ import {applyItemUse,itemUseFor,validateItemUse} from './item-use.ts';
 import {ItemNameResolver} from './item-names.ts';
 import {fetchRecipeIndex} from './recipe-index.ts';
 import type {RecipeUseMap} from './item-use.ts';
+import {defaultOpportunitySort,sortOpportunities} from './opportunity-sort.ts';
+import type {OpportunitySort,OpportunitySortKey} from './opportunity-sort.ts';
 
 type PublicProblem={code:string;message:string;action?:string};
 
@@ -433,13 +435,20 @@ const server=createServer(async(request,response)=>{
   }
   if(path==='/api/opportunities'){
    requireMethod(method,'GET');
+   const requestedSort=url.searchParams.get('sort');
+   const requestedDirection=url.searchParams.get('direction');
+   const sortKeys:readonly string[]=['name','cost','profit','roi','score'];
+   if((requestedSort!==null&&!sortKeys.includes(requestedSort))||(requestedDirection!==null&&requestedDirection!=='asc'&&requestedDirection!=='desc'))fail(422,'INVALID_SORT','Choose a valid opportunity sort.','Sort by item name, buyout, potential profit, ROI or score, in ascending or descending order.');
+   const key=(requestedSort??defaultOpportunitySort.key) as OpportunitySortKey;
+   const sort:OpportunitySort={key,direction:(requestedDirection??(key==='name'?'asc':'desc')) as OpportunitySort['direction']};
    const bankroll=url.searchParams.has('bankroll')?Math.round(Number(url.searchParams.get('bankroll'))*10_000):settings.bankroll;
    const minROI=url.searchParams.has('roi')?Number(url.searchParams.get('roi'))/100:settings.minROI;
    let configured:Settings;
    try{configured=validSettings({...settings,bankroll,minROI});}
    catch{fail(422,'INVALID_FILTERS','The bankroll or ROI filter is invalid.', 'Enter a positive bankroll and an ROI between 0% and 1000%.');}
    const snapshot=latest();
-   const rows=snapshot?(configured.bankroll===settings.bankroll&&configured.minROI===settings.minROI?cached:marketScan(snapshot,configured)):[];
+   const unsorted=snapshot?(configured.bankroll===settings.bankroll&&configured.minROI===settings.minROI?cached:marketScan(snapshot,configured)):[];
+   const rows=sortOpportunities(unsorted,sort,id=>{const name=state.names[id];return name&&name!==`Item #${id}`?name:`Item #${id}`;});
    if(!demo)nameResolver.enqueue(rows.slice(0,100).map(row=>row.itemId));
    json(response,{rows:rows.slice(0,100),mode,at:snapshot?.at});
    return;
