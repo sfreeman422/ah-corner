@@ -1,7 +1,7 @@
 import React,{useEffect,useRef,useState} from 'react';
 import {createRoot} from 'react-dom/client';
 import type {Alert,Opportunity,Settings,Stats,Trade} from '../src/types.ts';
-import type {ItemUseKind,ItemUseMap} from '../src/item-use.ts';
+import type {ItemUseKind,ItemUseMap,RecipeUseMap} from '../src/item-use.ts';
 import type {ItemNameDetails} from '../src/blizzard.ts';
 import './style.css';
 
@@ -50,7 +50,7 @@ function ItemLink({id,name,source}:{id:number;name:string;source?:ItemNameDetail
 }
 
 type Collector={busy:boolean;lastChecked:number;lastSuccess:number;lastError:PublicProblem|null;nextScheduledAt:number|null};
-type Status={mode:string;market:string;houseVerified:boolean;at:number|null;listingCount:number;snapshots:number;collector:Collector;settings:Settings;watch:number[];names:Record<number,string>;nameSources:Record<number,ItemNameDetails['source']>;itemUses:ItemUseMap;stale:boolean};
+type Status={mode:string;market:string;houseVerified:boolean;at:number|null;listingCount:number;snapshots:number;collector:Collector;settings:Settings;watch:number[];names:Record<number,string>;nameSources:Record<number,ItemNameDetails['source']>;itemUses:ItemUseMap;recipeUses:RecipeUseMap;recipeIndex:{dataset:string;build:string;fetchedAt:number}|null;recipeLookup:{busy:boolean;error:string|null};stale:boolean};
 type Position={itemId:number;quantity:number;basis:number;realized:number;unmatched:number};
 type Backtest={at:number;itemId:number;target:number;cost:number;potentialProfit:number;competingUnits:number;held:boolean};
 
@@ -81,6 +81,7 @@ function App({onLogout}:{onLogout?:()=>void}){
  const [form,setForm]=useState({side:'buy',itemId:'',quantity:'',total:'',fee:'0'});
  const resolvedName=(itemId:number)=>{const value=status?.names[itemId];return value&&value!==`Item #${itemId}`?value:undefined;};
  const name=(itemId:number)=>resolvedName(itemId)||`Item #${itemId} (name unavailable)`;
+ const use=(itemId:number)=>status?.itemUses?.[itemId]||status?.recipeUses?.[itemId];
  const filtered=rows.filter(row=>(showUnnamed||!!resolvedName(row.itemId))&&(!onlyWatch||status?.watch.includes(row.itemId))&&name(row.itemId).toLowerCase().includes(query.toLowerCase()));
  const active=filtered.find(row=>row.itemId===id)||filtered[0];
 
@@ -190,7 +191,10 @@ function App({onLogout}:{onLogout?:()=>void}){
     </section>
     <details className="panel">
      <summary>Record item-use research</summary>
-     <p className="muted">Unresearched items are watch-only. Record why players might use an item and where you checked; this is your assessment, not proof of sales. Excluded items are hidden. Enter an excluded item's ID and choose Unknown to restore it.</p>
+     <p className="muted">Recipe uses are supplied by <a href="https://warcraftforever.com/developers/data/" target="_blank" rel="noopener noreferrer">Warcraft Forever</a>. Unresearched items are watch-only. Your research overrides automatic evidence; choose Unknown to clear your override. Excluded items are hidden.</p>
+     {status?.mode==='live'&&status.recipeLookup?.error&&<p className="muted">{status.recipeLookup.error}</p>}
+     {!status?.recipeIndex&&status?.mode==='live'&&!status.recipeLookup?.error&&<p className="muted">Loading the recipe index; items without research remain watch-only.</p>}
+     {status?.recipeIndex&&<p className="muted">Recipe data: Forever build {status.recipeIndex.build}, checked {new Date(status.recipeIndex.fetchedAt).toLocaleString()}. A recipe relationship does not prove demand or sales.</p>}
      <form className="filters" onSubmit={event=>{event.preventDefault();void action(()=>api('item-use',{itemId:Number(researchId),kind:researchKind,note:researchNote}),'Item research saved.');}}>
       <label>Item ID<input required type="number" min="1" step="1" value={researchId} onChange={event=>{const next=event.target.value;const evidence=status?.itemUses?.[Number(next)];setResearchId(next);setResearchKind(evidence?.kind||'unknown');setResearchNote(evidence?.note||'');}}/></label>
       <label>Use or decision<select value={researchKind} onChange={event=>setResearchKind(event.target.value as ItemUseKind|'unknown')}><option value="unknown">Unknown</option><option value="profession">Profession / crafting</option><option value="quest">Quest</option><option value="consumable">Consumable</option><option value="equipment">Equipment</option><option value="other">Other use</option><option value="exclude">Exclude from queue</option></select></label>
@@ -201,7 +205,7 @@ function App({onLogout}:{onLogout?:()=>void}){
     <div className="split">
      <section className="panel">
       <h3>Opportunity queue <span>{filtered.length}</span></h3>
-      <div className="scroll"><table><thead><tr><th>Item / confidence</th><th>Buyout</th><th>Potential profit</th><th>ROI</th><th>Score</th></tr></thead><tbody>{filtered.map(row=><tr key={row.itemId} onClick={()=>setId(row.itemId)} className={active?.itemId===row.itemId?'chosen':''}><td><ItemLink id={row.itemId} name={name(row.itemId)} source={status?.nameSources?.[row.itemId]}/> <button className="link" onClick={()=>setId(row.itemId)} aria-label={`View details for ${name(row.itemId)}`}>Details</button><small className={row.confidence==='candidate'?'green':'muted'}>{row.confidence} · {status?.itemUses?.[row.itemId]?.kind||'use unknown'}</small></td><td>{money(row.cost)}</td><td className="green">+{money(row.profit)}</td><td>{pct(row.roi)}</td><td>{row.score}</td></tr>)}</tbody></table>{!filtered.length&&<p className="empty">No named opportunities match your filters yet. Names may still be loading; use “Include items without names” to inspect missing names.</p>}</div>
+      <div className="scroll"><table><thead><tr><th>Item / confidence</th><th>Buyout</th><th>Potential profit</th><th>ROI</th><th>Score</th></tr></thead><tbody>{filtered.map(row=><tr key={row.itemId} onClick={()=>setId(row.itemId)} className={active?.itemId===row.itemId?'chosen':''}><td><ItemLink id={row.itemId} name={name(row.itemId)} source={status?.nameSources?.[row.itemId]}/> <button className="link" onClick={()=>setId(row.itemId)} aria-label={`View details for ${name(row.itemId)}`}>Details</button><small className={row.confidence==='candidate'?'green':'muted'}>{row.confidence} · {use(row.itemId)?.kind||'use unknown'}</small></td><td>{money(row.cost)}</td><td className="green">+{money(row.profit)}</td><td>{pct(row.roi)}</td><td>{row.score}</td></tr>)}</tbody></table>{!filtered.length&&<p className="empty">No named opportunities match your filters yet. Names may still be loading; use “Include items without names” to inspect missing names.</p>}</div>
      </section>
      <section className="panel detail">
       {active?<>
@@ -209,6 +213,7 @@ function App({onLogout}:{onLogout?:()=>void}){
        <div className="three"><div><small>BUY UNITS</small><strong>{active.quantity}</strong></div><div><small>TARGET / UNIT</small><strong>{unit(active.target)}</strong></div><div><small>BREAK-EVEN UNITS</small><strong>{active.breakEvenUnits}</strong></div></div>
        <p><strong>{active.purchaseListings} listings in buyout</strong> · potential profit {money(active.profit)} ({money(active.profit/Math.max(1,active.purchaseListings))} per listed auction). This is not gold per hour or a prediction of sales.</p>
        {active.reasons.map(reason=><p className="muted" key={reason}>{reason}</p>)}
+       {use(active.itemId)?.source==='warcraftforever-recipe'&&<p><a href={`https://warcraftforever.com/spells/${status?.recipeUses?.[active.itemId]?.recipeId}`} target="_blank" rel="noopener noreferrer">View recipe at Warcraft Forever</a></p>}
        <h4>Order book · lowest tiers</h4>
        <div className="depth">{active.tiers.map(tier=><div className="tier" key={tier.price}><span>{unit(tier.price)}</span><div className="bar"><i className={tier.price<=active.buyMax?'buy':''} style={{width:`${tier.units/Math.max(...active.tiers.map(value=>value.units))*100}%`}}/></div><span>{tier.units}</span></div>)}</div>
        <small>Amber = acquisition tier; green = remaining competition. Max acquisition tier: {unit(active.buyMax)} per unit. Stack buyout total: {money(active.cost)}.</small>

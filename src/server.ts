@@ -12,6 +12,8 @@ import type {Alert, Opportunity, Settings} from './types.ts';
 import {Sessions} from './auth.ts';
 import {applyItemUse,itemUseFor,validateItemUse} from './item-use.ts';
 import {ItemNameResolver} from './item-names.ts';
+import {fetchRecipeIndex} from './recipe-index.ts';
+import type {RecipeUseMap} from './item-use.ts';
 
 type PublicProblem={code:string;message:string;action?:string};
 
@@ -132,6 +134,9 @@ let lastSuccess=0;
 let lastCollectionError:PublicProblem|undefined;
 let cached:Opportunity[]=[];
 let saveQueue=Promise.resolve();
+let recipeBusy=false;
+let recipeError:string|null=null;
+const recipeAbort=new AbortController();
 
 function save(){
  const copy=structuredClone(state);
@@ -153,7 +158,7 @@ const nameResolver=new ItemNameResolver({
 function latest(){return snapshots.at(-1);}
 
 function marketScan(snapshot:NonNullable<ReturnType<typeof latest>>,configured:Settings){
- const rows=applyItemUse(scan(snapshot,snapshots,configured),state.itemUses||{});
+ const rows=applyItemUse(scan(snapshot,snapshots,configured),state.itemUses||{},state.recipeUses||{});
  return provisional?rows.map(row=>({...row,confidence:'watch' as const,reasons:['Auction house mapping is unverified; compare in-game prices before acting.',...row.reasons]})):rows;
 }
 
@@ -161,6 +166,36 @@ function refresh(){
  const snapshot=latest();
  cached=snapshot?marketScan(snapshot,settings):[];
  if(!demo)nameResolver.enqueue([...cached.slice(0,100).map(row=>row.itemId),...state.watch]);
+}
+
+// Keep a compact reverse index in the same MySQL-backed state as player notes.
+// A failed or interrupted refresh never replaces the last complete index.
+async function updateRecipes(){
+ if(demo||recipeBusy)return;
+ const last=state.recipeIndex?.fetchedAt;
+ if(typeof last==='number'&&Number.isFinite(last)&&last<=Date.now()&&Date.now()-last<24*3_600_000)return;
+ recipeBusy=true;
+ try{
+  const result=await fetchRecipeIndex({signal:recipeAbort.signal});
+  const now=Date.now();
+  const professions:Record<number,string>={164:'Blacksmithing',165:'Leatherworking',171:'Alchemy',182:'Herbalism',185:'Cooking',186:'Mining',197:'Tailoring',202:'Engineering',333:'Enchanting',356:'Fishing',393:'Skinning',755:'Jewelcrafting',129:'First Aid'};
+  const uses:RecipeUseMap={};
+  for(const [id,recipe] of Object.entries(result.uses)){
+   const note=`${recipe.quantity} required for ${recipe.name}`.slice(0,300);
+   const profession=professions[recipe.profession]||`Profession #${recipe.profession}`;
+   const old=state.recipeUses?.[id];
+   const updatedAt=old&&old.recipeId===recipe.recipeId&&old.note===note&&old.profession===profession?old.updatedAt:now;
+   uses[id]={kind:'profession',note,source:'warcraftforever-recipe',updatedAt,recipeId:recipe.recipeId,profession,dataset:result.dataset};
+  }
+  const previousUses=state.recipeUses,previousIndex=state.recipeIndex;
+  state.recipeUses=uses;
+  state.recipeIndex={dataset:result.dataset,build:result.build,fetchedAt:now};
+  try{await save();}catch(error){if(state.recipeUses===uses){state.recipeUses=previousUses;state.recipeIndex=previousIndex;}throw error;}
+  recipeError=null;
+  refresh();
+ }catch(error){
+  if(!recipeAbort.signal.aborted){recipeError='Recipe data is temporarily unavailable. The app will retry; saved research remains available.';console.warn('Recipe index refresh failed:',errorMessage(error));}
+ }finally{recipeBusy=false;}
 }
 
 function expireInMemorySnapshots(){
@@ -239,6 +274,8 @@ else{
 
 const pollMinutes=Math.max(5,positiveInteger('POLL_MINUTES',60));
 const interval=collectSchedule==='interval'?setInterval(()=>void collect(),pollMinutes*60_000):undefined;
+const recipeStart=!demo?setTimeout(()=>void updateRecipes(),3_000):undefined;
+const recipeInterval=!demo?setInterval(()=>void updateRecipes(),3_600_000):undefined;
 const port=positiveInteger('PORT',3000);
 const host=process.env.HOST||'127.0.0.1';
 const allowedHosts=csv('APP_TRUSTED_HOSTS',[`localhost:${port}`,`127.0.0.1:${port}`,'localhost:5173','127.0.0.1:5173']);
@@ -348,7 +385,7 @@ const server=createServer(async(request,response)=>{
    if(expireLiveState())await save();
    if(!demo)nameResolver.enqueue([...state.watch,...state.trades.map(trade=>trade.itemId),...state.alerts.map(alert=>alert.itemId)]);
    const snapshot=latest();
-   json(response,{mode,market,houseVerified,at:snapshot?.at||null,listingCount:snapshot?.listings.length||0,snapshots:snapshots.length,collector:{busy,lastChecked,lastSuccess,lastError:lastCollectionError||null,nextScheduledAt:collectSchedule==='interval'&&lastChecked?lastChecked+pollMinutes*60_000:null},settings,watch:state.watch,names:state.names,nameSources:state.nameSources||{},itemUses:state.itemUses||{},stale:!snapshot||Date.now()-snapshot.at>7_200_000});
+   json(response,{mode,market,houseVerified,at:snapshot?.at||null,listingCount:snapshot?.listings.length||0,snapshots:snapshots.length,collector:{busy,lastChecked,lastSuccess,lastError:lastCollectionError||null,nextScheduledAt:collectSchedule==='interval'&&lastChecked?lastChecked+pollMinutes*60_000:null},settings,watch:state.watch,names:state.names,nameSources:state.nameSources||{},itemUses:state.itemUses||{},recipeUses:state.recipeUses||{},recipeIndex:state.recipeIndex||null,recipeLookup:{busy:recipeBusy,error:recipeError},stale:!snapshot||Date.now()-snapshot.at>7_200_000});
    return;
   }
   if(path==='/api/settings'){
@@ -408,13 +445,13 @@ const server=createServer(async(request,response)=>{
   }
   if(path==='/api/backtest'){
    requireMethod(method,'GET');
-   json(response,provisional?[]:backtest(snapshots,settings).filter(result=>{const evidence=itemUseFor(state.itemUses||{},result.itemId);return !!evidence&&evidence.kind!=='exclude'&&evidence.updatedAt<=result.at;}));
+   json(response,provisional?[]:backtest(snapshots,settings).filter(result=>{const evidence=itemUseFor(state.itemUses||{},result.itemId,state.recipeUses||{});return !!evidence&&evidence.kind!=='exclude'&&evidence.updatedAt<=result.at;}));
    return;
   }
   if(path==='/api/alerts'){
    requireMethod(method,'GET');
    if(expireLiveState())await save();
-   json(response,provisional?[]:state.alerts.filter(alert=>{const evidence=itemUseFor(state.itemUses||{},alert.itemId);return !!evidence&&evidence.kind!=='exclude'&&evidence.updatedAt<=alert.at;}));
+   json(response,provisional?[]:state.alerts.filter(alert=>{const evidence=itemUseFor(state.itemUses||{},alert.itemId,state.recipeUses||{});return !!evidence&&evidence.kind!=='exclude'&&evidence.updatedAt<=alert.at;}));
    return;
   }
   if(path==='/api/portfolio'){
@@ -503,6 +540,9 @@ server.listen(port,host,()=>console.log(`AH Corner ${mode}: http://${host}:${por
 
 function shutdown(){
  clearInterval(interval);
+ clearInterval(recipeInterval);
+ clearTimeout(recipeStart);
+ recipeAbort.abort();
  nameResolver.close();
  server.close(()=>void store.close());
 }
