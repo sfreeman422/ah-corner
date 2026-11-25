@@ -158,6 +158,7 @@ let snapshots=await loadSnapshots();
 let busy=false;
 let lastChecked=0;
 let lastSuccess=0;
+let lastRefreshChanged=false;
 let lastCollectionError:PublicProblem|undefined;
 let cached:Opportunity[]=[];
 let cachedBase:Opportunity[]=[];
@@ -416,6 +417,7 @@ async function collect(){
  if(busy)return false;
  busy=true;
  lastChecked=Date.now();
+ const previousBook=latest()?.key;
  try{
   expireInMemorySnapshots();
   await store.prune();
@@ -446,6 +448,7 @@ async function collect(){
   refresh();
   await save();
   await alerts();
+  lastRefreshChanged=latest()?.key!==previousBook;
   lastSuccess=Date.now();
   lastCollectionError=undefined;
   return true;
@@ -749,10 +752,14 @@ const server=createServer(async(request,response)=>{
    return;
   }
   if(path==='/api/collect'){
+   if(method==='GET'){
+    json(response,{busy,lastChecked,lastSuccess,lastError:lastCollectionError||null,changed:lastRefreshChanged});
+    return;
+   }
    requireMethod(method,'POST');
-   if(busy)fail(409,'COLLECTION_IN_PROGRESS','A market refresh is already in progress.', 'Wait for it to finish; the status panel will update automatically.');
-   void collect();
-   json(response,{status:'started',message:'Market refresh started. The status panel will update when it finishes.'},202);
+   await body(request);
+   if(!busy)void collect();
+   json(response,{status:'started',lastChecked},202);
    return;
   }
   if(path==='/api/addon.lua'){

@@ -78,6 +78,7 @@ function HistoryChart({history,loading}:{history:Stats[];loading:boolean}){
 }
 
 type Collector={busy:boolean;lastChecked:number;lastSuccess:number;lastError:PublicProblem|null;nextScheduledAt:number|null};
+type RefreshStatus=Pick<Collector,'busy'|'lastChecked'|'lastSuccess'|'lastError'>&{changed:boolean};
 type Status={mode:string;market:string;houseVerified:boolean;at:number|null;listingCount:number;snapshots:number;collector:Collector;settings:Settings;watch:number[];names:Record<number,string>;nameSources:Record<number,ItemNameDetails['source']>;itemUses:ItemUseMap;recipeUses:RecipeUseMap;blizzardMetadata:BlizzardItemMetadataMap;itemCatalog?:ItemCategoryIndex;catalogLookup?:{busy:boolean;error:string|null;classified:number;knownUses?:number;total:number};metadataError:string|null;recipeIndex:{dataset:string;build:string;fetchedAt:number}|null;recipeLookup:{busy:boolean;error:string|null};stale:boolean};
 type Position={itemId:number;quantity:number;basis:number;realized:number;unmatched:number};
 type Backtest={at:number;itemId:number;target:number;cost:number;potentialProfit:number;competingUnits:number;held:boolean};
@@ -133,6 +134,9 @@ function App({onLogout}:{onLogout?:()=>void}){
  const [backtests,setBacktests]=useState<Backtest[]>([]);
  const [error,setError]=useState<PublicProblem>();
  const [notice,setNotice]=useState('');
+ const [refreshing,setRefreshing]=useState(false);
+ const [refreshError,setRefreshError]=useState<PublicProblem>();
+ const refreshLock=useRef(false);
  const [onlyWatch,setOnlyWatch]=useState(false);
  const [showUnnamed,setShowUnnamed]=useState(false);
  const [query,setQuery]=useState('');
@@ -247,6 +251,31 @@ function App({onLogout}:{onLogout?:()=>void}){
   }catch(cause){setError(problemFrom(cause));}
  }
 
+ async function refreshSource(){
+  if(refreshLock.current)return;
+  refreshLock.current=true;
+  setRefreshing(true);
+  setRefreshError(undefined);
+  setNotice('');
+  try{
+   const started=await api<{lastChecked:number}>('collect',{});
+   const deadline=Date.now()+5*60_000;
+   while(Date.now()<deadline){
+    const result=await api<RefreshStatus>('collect');
+    if(!result.busy&&result.lastChecked>=started.lastChecked){
+     await load();
+     if(result.lastError)throw new ApiFailure(result.lastError);
+     if(result.lastSuccess<started.lastChecked)break;
+     setNotice(result.changed?'Market refreshed. New auction prices and listings are loaded.':'Market checked successfully. The auction book is unchanged.');
+     return;
+    }
+    await new Promise(resolve=>setTimeout(resolve,2_000));
+   }
+   setNotice('The refresh is taking longer than expected. Check the last snapshot time for updates.');
+  }catch(cause){setRefreshError(problemFrom(cause));}
+  finally{refreshLock.current=false;setRefreshing(false);}
+ }
+
  const sourceLabel=status?.mode==='demo'?'SIMULATED DATA':status?.stale?'STALE DATA':status?.collector.lastError?'REFRESH ISSUE':'LIVE SOURCE';
  const provisional=status?.mode==='live'&&!status.houseVerified;
  const insights=active&&status?opportunityInsights(active,status.settings):undefined;
@@ -264,11 +293,11 @@ function App({onLogout}:{onLogout?:()=>void}){
   <main>
    <div className="intro">
     <div><p className="eyebrow">MARKET OPERATIONS</p><h2>Find the gap. Price the risk.</h2><p>Choose a strategy, verify live listings, and track actual returns.</p></div>
-    <button disabled={status?.collector.busy} onClick={()=>action(()=>api('collect',{}),'Market refresh started. The status panel will update when it finishes.')}>{status?.collector.busy?'Refreshing source…':'↻ Refresh source'}</button>
+    <button disabled={refreshing||status?.collector.busy} onClick={()=>void refreshSource()}>{refreshing||status?.collector.busy?'Refreshing source…':'↻ Refresh source'}</button>
    </div>
    {status?.mode==='demo'&&<div className="banner">Demo mode — all market snapshots are synthetic. No live trade recommendations or outbound alerts.</div>}
    {provisional&&<div className="banner bad" role="alert"><strong>Unverified auction house.</strong> These are live prices from house {status?.market.split(':').at(-1)}, but its US PvP Horde mapping has not been verified in-game. Opportunities are watch-only; alerts, backtesting and addon plans are disabled until verification.</div>}
-   {status?.collector.lastError&&<div className="banner bad" role="alert"><strong>{status.collector.lastError.message}</strong>{status.collector.lastError.action&&<span> {status.collector.lastError.action}</span>}</div>}
+   {(refreshError||status?.collector.lastError)&&<div className="banner bad" role="alert"><strong>{(refreshError||status?.collector.lastError)?.message}</strong> {(refreshError||status?.collector.lastError)?.action}</div>}
    {error&&<div className="banner bad" role="alert"><strong>{error.message}</strong>{error.action&&<span> {error.action}</span>}</div>}
    {notice&&<div className="banner" role="status">{notice} <button onClick={()=>setNotice('')}>Dismiss</button></div>}
    <section className="metrics">

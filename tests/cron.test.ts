@@ -121,3 +121,36 @@ test('expired in-memory live books disappear from API responses and after failed
   assert.equal((await status()).snapshots,0,'failed collection does not leave expired data in memory');
  },undefined,false);
 });
+
+test('manual refresh tracks an unchanged book and reports a later failure',async()=>{
+ await withServer(false,async(origin,_port,dir)=>{
+  const endpoint=`${origin}/api/collect`;
+  const post={method:'POST',headers:{'Content-Type':'application/json'},body:'{}'};
+  const progress=async()=>(await fetch(endpoint)).json();
+  const finish=async(started:number)=>{
+   for(let attempt=0;attempt<80;attempt++){
+    const result=await progress();
+    if(!result.busy&&result.lastChecked>=started)return result;
+    await new Promise(resolve=>setTimeout(resolve,25));
+   }
+   assert.fail('Manual refresh did not finish');
+  };
+  const initial=(await (await fetch(`${origin}/api/status`)).json()).at;
+  const response=await fetch(endpoint,post);
+  assert.equal(response.status,202);
+  const {lastChecked}=await response.json();
+  const duplicate=await fetch(endpoint,post);
+  assert.equal(duplicate.status,202);
+  assert.equal((await duplicate.json()).lastChecked,lastChecked,'joins the active collection');
+  const completed=await finish(lastChecked);
+  assert.ok(completed.lastSuccess>=lastChecked);
+  assert.equal(completed.lastError,null);
+  assert.equal(completed.changed,false);
+  assert.ok((await (await fetch(`${origin}/api/status`)).json()).at>initial,'unchanged book gets a fresh observation');
+  await writeFile(join(dir,'fail-collection'),'1');
+  const failedStart=await (await fetch(endpoint,post)).json();
+  const failure=await finish(failedStart.lastChecked);
+  assert.equal(failure.lastError.code,'COLLECTION_FAILED');
+  assert.equal(failure.lastSuccess,completed.lastSuccess);
+ },undefined,false);
+});
