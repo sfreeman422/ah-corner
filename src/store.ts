@@ -6,7 +6,7 @@ import type {ItemUseMap,RecipeUseMap} from './item-use.ts';
 import type {ItemNameDetails} from './blizzard.ts';
 import type {Alert, Settings, Snapshot, Stats, Trade} from './types.ts';
 
-export type State={names:Record<number,string>;nameSources?:Record<number,ItemNameDetails['source']>;namesFetchedAt?:number;trades:Trade[];alerts:Alert[];watch:number[];modified?:string;strategy?:Settings;itemUses?:ItemUseMap;recipeUses?:RecipeUseMap;recipeIndex?:{dataset:string;build:string;fetchedAt:number}};
+export type State={names:Record<number,string>;nameSources?:Record<number,ItemNameDetails['source']>;namesFetchedAt?:number;trades:Trade[];alerts:Alert[];watch:number[];modified?:string;strategy?:Settings;userStrategies?:Record<string,Settings>;itemUses?:ItemUseMap;recipeUses?:RecipeUseMap;recipeIndex?:{dataset:string;build:string;fetchedAt:number}};
 export type Store={
  load:()=>Promise<State>;
  save:(s:State)=>Promise<void>;

@@ -1,4 +1,4 @@
-import {randomUUID} from 'node:crypto';
+import {createHash,randomUUID} from 'node:crypto';
 import {readFile} from 'node:fs/promises';
 import {createServer} from 'node:http';
 import type {IncomingMessage, ServerResponse} from 'node:http';
@@ -135,15 +135,28 @@ let lastChecked=0;
 let lastSuccess=0;
 let lastCollectionError:PublicProblem|undefined;
 let cached:Opportunity[]=[];
+let cachedFresh:boolean|undefined;
+const strategyScans=new Map<string,Opportunity[]>();
 let saveQueue=Promise.resolve();
 let recipeBusy=false;
 let recipeError:string|null=null;
 const recipeAbort=new AbortController();
 
 function save(){
- const copy=structuredClone(state);
- saveQueue=saveQueue.catch(()=>{}).then(()=>store.save(copy));
+ // Capture at the start of the queued write so a concurrent user-strategy
+ // commit cannot be overwritten by an older snapshot of the shared state.
+ saveQueue=saveQueue.catch(()=>{}).then(()=>store.save(structuredClone(state)));
  return saveQueue;
+}
+
+function saveUserStrategy(key:string,next:Settings){
+ const write=saveQueue.catch(()=>{}).then(async()=>{
+  const updated={...state.userStrategies,[key]:next};
+  await store.save(structuredClone({...state,userStrategies:updated}));
+  state.userStrategies=updated;
+ });
+ saveQueue=write;
+ return write;
 }
 
 const nameResolver=new ItemNameResolver({
@@ -165,9 +178,24 @@ function marketScan(snapshot:NonNullable<ReturnType<typeof latest>>,configured:S
 }
 
 function refresh(){
+ strategyScans.clear();
  const snapshot=latest();
+ cachedFresh=snapshot? snapshot.source==='demo'||Date.now()-snapshot.at<=2*3_600_000:undefined;
  cached=snapshot?marketScan(snapshot,settings):[];
  if(!demo)nameResolver.enqueue([...cached.slice(0,100).map(row=>row.itemId),...state.watch]);
+}
+
+function scanFor(configured:Settings){
+ const snapshot=latest();
+ if(!snapshot)return [];
+ const key=JSON.stringify(configured);
+ if(key===JSON.stringify(settings))return cached;
+ const found=strategyScans.get(key);
+ if(found){strategyScans.delete(key);strategyScans.set(key,found);return found;}
+ const rows=marketScan(snapshot,configured);
+ strategyScans.set(key,rows);
+ if(strategyScans.size>4)strategyScans.delete(strategyScans.keys().next().value!);
+ return rows;
 }
 
 // Keep a compact reverse index in the same MySQL-backed state as player notes.
@@ -210,7 +238,7 @@ function expireInMemorySnapshots(){
  const snapshot=latest();
  if(snapshot){
   const fresh=snapshot.source==='demo'||Date.now()-snapshot.at<=2*3_600_000;
-  if(cached.some(row=>row.checks.fresh!==fresh))refresh();
+  if(cachedFresh!==fresh)refresh();
  }
 }
 
@@ -388,14 +416,19 @@ const server=createServer(async(request,response)=>{
    }
    fail(405,'METHOD_NOT_ALLOWED','That action is not available with this request method.');
   }
-  if(path.startsWith('/api/')&&requireAuth&&!sessions.valid(request.headers.cookie))fail(401,'SIGN_IN_REQUIRED','Please sign in with Slack.','Your session may have expired.');
+  const identity=path.startsWith('/api/')&&requireAuth?sessions.identity(request.headers.cookie):null;
+  if(path.startsWith('/api/')&&requireAuth&&!identity)fail(401,'SIGN_IN_REQUIRED','Please sign in with Slack.','Your session may have expired.');
+  // Workspace and Slack user are both necessary: IDs are not global across
+  // workspaces. Only the server-side Mocker exchange may supply these values.
+  const userKey=identity?createHash('sha256').update(JSON.stringify([identity.teamId,identity.userId])).digest('hex'):null;
+  const userSettings=userKey&&state.userStrategies?.[userKey]?validSettings({...defaultSettings,...state.userStrategies[userKey]}):settings;
   if(path.startsWith('/api/'))expireInMemorySnapshots();
   if(path==='/api/status'){
    requireMethod(method,'GET');
    if(expireLiveState())await save();
    if(!demo)nameResolver.enqueue([...state.watch,...state.trades.map(trade=>trade.itemId),...state.alerts.map(alert=>alert.itemId)]);
    const snapshot=latest();
-   json(response,{mode,market,houseVerified,at:snapshot?.at||null,listingCount:snapshot?.listings.length||0,snapshots:snapshots.length,collector:{busy,lastChecked,lastSuccess,lastError:lastCollectionError||null,nextScheduledAt:collectSchedule==='interval'&&lastChecked?lastChecked+pollMinutes*60_000:null},settings,watch:state.watch,names:state.names,nameSources:state.nameSources||{},itemUses:state.itemUses||{},recipeUses:state.recipeUses||{},recipeIndex:state.recipeIndex||null,recipeLookup:{busy:recipeBusy,error:recipeError},stale:!snapshot||Date.now()-snapshot.at>7_200_000});
+   json(response,{mode,market,houseVerified,at:snapshot?.at||null,listingCount:snapshot?.listings.length||0,snapshots:snapshots.length,collector:{busy,lastChecked,lastSuccess,lastError:lastCollectionError||null,nextScheduledAt:collectSchedule==='interval'&&lastChecked?lastChecked+pollMinutes*60_000:null},settings:userSettings,watch:state.watch,names:state.names,nameSources:state.nameSources||{},itemUses:state.itemUses||{},recipeUses:state.recipeUses||{},recipeIndex:state.recipeIndex||null,recipeLookup:{busy:recipeBusy,error:recipeError},stale:!snapshot||Date.now()-snapshot.at>7_200_000});
    return;
   }
   if(path==='/api/settings'){
@@ -407,13 +440,16 @@ const server=createServer(async(request,response)=>{
    }catch{
     fail(422,'INVALID_STRATEGY','Check the strategy settings before saving.', 'Use a positive bankroll, exposure between 0% and 100%, nonnegative minimum profit and ROI, a fee below 100%, and 1–24 history observations.');
    }
-   const previous=state.strategy;
-   state.strategy=next;
-   try{await save();}
-   catch(error){if(state.strategy===next)state.strategy=previous;throw error;}
-   settings=next;
-   refresh();
-   json(response,settings);
+   if(userKey)await saveUserStrategy(userKey,next);
+   else{
+    const previous=state.strategy;
+    state.strategy=next;
+    try{await save();}
+    catch(error){if(state.strategy===next)state.strategy=previous;throw error;}
+    settings=next;
+    refresh();
+   }
+   json(response,next);
    return;
   }
   if(path==='/api/item-use'){
@@ -441,13 +477,13 @@ const server=createServer(async(request,response)=>{
    if((requestedSort!==null&&!sortKeys.includes(requestedSort))||(requestedDirection!==null&&requestedDirection!=='asc'&&requestedDirection!=='desc'))fail(422,'INVALID_SORT','Choose a valid opportunity sort.','Sort by item name, buyout, potential profit, ROI or score, in ascending or descending order.');
    const key=(requestedSort??defaultOpportunitySort.key) as OpportunitySortKey;
    const sort:OpportunitySort={key,direction:(requestedDirection??(key==='name'?'asc':'desc')) as OpportunitySort['direction']};
-   const bankroll=url.searchParams.has('bankroll')?Math.round(Number(url.searchParams.get('bankroll'))*10_000):settings.bankroll;
-   const minROI=url.searchParams.has('roi')?Number(url.searchParams.get('roi'))/100:settings.minROI;
+   const bankroll=url.searchParams.has('bankroll')?Math.round(Number(url.searchParams.get('bankroll'))*10_000):userSettings.bankroll;
+   const minROI=url.searchParams.has('roi')?Number(url.searchParams.get('roi'))/100:userSettings.minROI;
    let configured:Settings;
-   try{configured=validSettings({...settings,bankroll,minROI});}
+   try{configured=validSettings({...userSettings,bankroll,minROI});}
    catch{fail(422,'INVALID_FILTERS','The bankroll or ROI filter is invalid.', 'Enter a positive bankroll and an ROI between 0% and 1000%.');}
    const snapshot=latest();
-   const unsorted=snapshot?(configured.bankroll===settings.bankroll&&configured.minROI===settings.minROI?cached:marketScan(snapshot,configured)):[];
+   const unsorted=snapshot?scanFor(configured):[];
    const rows=sortOpportunities(unsorted,sort,id=>{const name=state.names[id];return name&&name!==`Item #${id}`?name:`Item #${id}`;});
    if(!demo)nameResolver.enqueue(rows.slice(0,100).map(row=>row.itemId));
    json(response,{rows:rows.slice(0,100),mode,at:snapshot?.at});
@@ -462,7 +498,7 @@ const server=createServer(async(request,response)=>{
   }
   if(path==='/api/backtest'){
    requireMethod(method,'GET');
-   json(response,provisional?[]:backtest(snapshots,settings).filter(result=>{const evidence=itemUseFor(state.itemUses||{},result.itemId,state.recipeUses||{});return !!evidence&&evidence.kind!=='exclude'&&evidence.updatedAt<=result.at;}));
+   json(response,provisional?[]:backtest(snapshots,userSettings).filter(result=>{const evidence=itemUseFor(state.itemUses||{},result.itemId,state.recipeUses||{});return !!evidence&&evidence.kind!=='exclude'&&evidence.updatedAt<=result.at;}));
    return;
   }
   if(path==='/api/alerts'){
@@ -531,7 +567,7 @@ const server=createServer(async(request,response)=>{
   if(path==='/api/addon.lua'){
    requireMethod(method,'GET');
    const snapshot=latest();
-   const rows=(!demo&&!provisional&&snapshot&&Date.now()-snapshot.at<7_200_000?cached.filter(value=>value.confidence==='candidate'):[]).slice(0,20);
+   const rows=(!demo&&!provisional&&snapshot&&Date.now()-snapshot.at<7_200_000?scanFor(userSettings).filter(value=>value.confidence==='candidate'):[]).slice(0,20);
    const code=`-- Generated advisory data. No game actions.\n${provisional?'-- Auction house mapping is unverified; no actionable entries.\n':''}AHCornerPlan = { market=${luaString(market)}, timestamp=${Math.floor((snapshot?.at||0)/1_000)}, rows={\n${rows.map(value=>`{id=${value.itemId}, name=${luaString(state.names[value.itemId]||`Item #${value.itemId}`)}, quantity=${value.quantity}, cost=${value.cost}, buyMax=${value.buyMax}, target=${value.target}},`).join('\n')}\n}}\n`;
    response.writeHead(200,{'Content-Type':'text/plain; charset=utf-8','Content-Disposition':'attachment; filename="Plan.lua"','Cache-Control':'no-store','X-Content-Type-Options':'nosniff','Referrer-Policy':'no-referrer','X-Frame-Options':'DENY'});
    response.end(code);
