@@ -1,6 +1,7 @@
-import React,{useEffect,useState} from 'react';
+import React,{useEffect,useRef,useState} from 'react';
 import {createRoot} from 'react-dom/client';
 import type {Alert,Opportunity,Settings,Stats,Trade} from '../src/types.ts';
+import type {ItemUseKind,ItemUseMap} from '../src/item-use.ts';
 import './style.css';
 
 type PublicProblem={code:string;message:string;action?:string};
@@ -43,8 +44,12 @@ const money=(c:number)=>`${(c/10_000).toFixed(2)}g`;
 const unit=(c:number)=>c>=10_000?`${(c/10_000).toFixed(4)}g`:`${(c/100).toFixed(2)}s`;
 const pct=(n:number)=>`${Math.round(n*100)}%`;
 
+function ItemLink({id,name}:{id:number;name:string}){
+ return <a href={`https://www.wowhead.com/forever/item=${id}`} target="_blank" rel="noopener noreferrer" onClick={event=>event.stopPropagation()}>{name}</a>;
+}
+
 type Collector={busy:boolean;lastChecked:number;lastSuccess:number;lastError:PublicProblem|null;nextScheduledAt:number|null};
-type Status={mode:string;market:string;houseVerified:boolean;at:number|null;listingCount:number;snapshots:number;collector:Collector;settings:Settings;watch:number[];names:Record<number,string>;stale:boolean};
+type Status={mode:string;market:string;houseVerified:boolean;at:number|null;listingCount:number;snapshots:number;collector:Collector;settings:Settings;watch:number[];names:Record<number,string>;itemUses:ItemUseMap;stale:boolean};
 type Position={itemId:number;quantity:number;basis:number;realized:number;unmatched:number};
 type Backtest={at:number;itemId:number;target:number;cost:number;potentialProfit:number;competingUnits:number;held:boolean};
 
@@ -53,6 +58,11 @@ function App({onLogout}:{onLogout?:()=>void}){
  const [rows,setRows]=useState<Opportunity[]>([]);
  const [bank,setBank]=useState(35);
  const [roi,setRoi]=useState(30);
+ const [exposure,setExposure]=useState(35);
+ const [minProfit,setMinProfit]=useState(0);
+ const [fee,setFee]=useState(5);
+ const [minHistory,setMinHistory]=useState(6);
+ const strategyDirty=useRef(false);
  const [tab,setTab]=useState('Scanner');
  const [id,setId]=useState<number>();
  const [history,setHistory]=useState<Stats[]>([]);
@@ -62,20 +72,42 @@ function App({onLogout}:{onLogout?:()=>void}){
  const [error,setError]=useState<PublicProblem>();
  const [notice,setNotice]=useState('');
  const [onlyWatch,setOnlyWatch]=useState(false);
+ const [showUnnamed,setShowUnnamed]=useState(false);
  const [query,setQuery]=useState('');
+ const [researchId,setResearchId]=useState('');
+ const [researchKind,setResearchKind]=useState<ItemUseKind|'unknown'>('unknown');
+ const [researchNote,setResearchNote]=useState('');
  const [form,setForm]=useState({side:'buy',itemId:'',quantity:'',total:'',fee:'0'});
- const name=(itemId:number)=>status?.names[itemId]||`Item #${itemId}`;
- const active=rows.find(row=>row.itemId===id)||rows[0];
+ const resolvedName=(itemId:number)=>{const value=status?.names[itemId];return value&&value!==`Item #${itemId}`?value:undefined;};
+ const name=(itemId:number)=>resolvedName(itemId)||`Item #${itemId} (name unavailable)`;
+ const filtered=rows.filter(row=>(showUnnamed||!!resolvedName(row.itemId))&&(!onlyWatch||status?.watch.includes(row.itemId))&&name(row.itemId).toLowerCase().includes(query.toLowerCase()));
+ const active=filtered.find(row=>row.itemId===id)||filtered[0];
+
+ useEffect(()=>{
+  if(!active)return;
+  const evidence=status?.itemUses?.[active.itemId];
+  setResearchId(String(active.itemId));
+  setResearchKind(evidence?.kind||'unknown');
+  setResearchNote(evidence?.note||'');
+ },[active?.itemId,status?.market]);
 
  async function load(){
   try{
    const [nextStatus,opportunities,nextAlerts,nextPortfolio]=await Promise.all([
     api<Status>('status'),
-    api<{rows:Opportunity[]}>(`opportunities?bankroll=${bank}&roi=${roi}`),
+    api<{rows:Opportunity[]}>('opportunities'),
     api<Alert[]>('alerts'),
     api<typeof portfolio>('portfolio')
    ]);
    setStatus(nextStatus);
+   if(!strategyDirty.current){
+    setBank(nextStatus.settings.bankroll/10_000);
+    setRoi(Number((nextStatus.settings.minROI*100).toFixed(2)));
+    setExposure(Number((nextStatus.settings.exposure*100).toFixed(2)));
+    setMinProfit(nextStatus.settings.minProfit/10_000);
+    setFee(Number((nextStatus.settings.fee*100).toFixed(2)));
+    setMinHistory(nextStatus.settings.minHistory);
+   }
    setRows(opportunities.rows);
    setAlerts(nextAlerts);
    setPortfolio(nextPortfolio);
@@ -87,7 +119,7 @@ function App({onLogout}:{onLogout?:()=>void}){
   void load();
   const timer=setInterval(()=>void load(),30_000);
   return()=>clearInterval(timer);
- },[bank,roi]);
+ },[]);
 
  useEffect(()=>{
   let live=true;
@@ -110,7 +142,6 @@ function App({onLogout}:{onLogout?:()=>void}){
   }catch(cause){setError(problemFrom(cause));}
  }
 
- const filtered=rows.filter(row=>(!onlyWatch||status?.watch.includes(row.itemId))&&name(row.itemId).toLowerCase().includes(query.toLowerCase()));
  const max=Math.max(1,...history.map(stat=>stat.floor));
  const sourceLabel=status?.mode==='demo'?'SIMULATED DATA':status?.stale?'STALE DATA':status?.collector.lastError?'REFRESH ISSUE':'LIVE SOURCE';
  const provisional=status?.mode==='live'&&!status.houseVerified;
@@ -131,28 +162,52 @@ function App({onLogout}:{onLogout?:()=>void}){
    {error&&<div className="banner bad" role="alert"><strong>{error.message}</strong>{error.action&&<span> {error.action}</span>}</div>}
    {notice&&<div className="banner" role="status">{notice} <button onClick={()=>setNotice('')}>Dismiss</button></div>}
    <section className="metrics">
-    <div><small>STRATEGY BANKROLL</small><strong>{bank}g</strong><label>Maximum exposure: {money(bank*10_000*(status?.settings.exposure||.35))}</label></div>
+    <div><small>STRATEGY BANKROLL</small><strong>{status?money(status.settings.bankroll):'—'}</strong><label>Maximum exposure: {status?money(status.settings.bankroll*status.settings.exposure):'—'}</label></div>
     <div><small>QUALIFYING BOOKS</small><strong>{rows.length}</strong><label>{rows.filter(row=>row.confidence==='candidate').length} historical candidates</label></div>
     <div><small>SNAPSHOTS STORED</small><strong>{status?.snapshots??'—'}</strong><label>{status?.listingCount.toLocaleString()||'—'} priced listings</label></div>
     <div><small>LAST SNAPSHOT</small><strong className="date">{status?.at?new Date(status.at).toLocaleTimeString([],{hour:'numeric',minute:'2-digit'}):'—'}</strong><label>{status?.at?new Date(status.at).toLocaleDateString():''}</label></div>
    </section>
    <nav>{['Scanner','Portfolio','Backtest','Alerts','Setup'].map(value=><button key={value} className={value===tab?'selected':''} onClick={()=>setTab(value)}>{value}</button>)}</nav>
    {tab==='Scanner'&&<>
+    <form className="filters" onSubmit={event=>{event.preventDefault();void action(async()=>{
+     await api<Settings>('settings',{bankroll:Math.round(bank*10_000),exposure:exposure/100,minROI:roi/100,minProfit:Math.round(minProfit*10_000),fee:fee/100,minHistory});
+     strategyDirty.current=false;
+    },'Strategy saved for this market.');}}>
+     <label>Bankroll (gold)<input required type="number" min="0.0001" step="0.0001" value={bank} onChange={event=>{strategyDirty.current=true;setBank(Number(event.target.value));}}/></label>
+     <label>Max exposure (%)<input required type="number" min="0.01" max="100" step="0.01" value={exposure} onChange={event=>{strategyDirty.current=true;setExposure(Number(event.target.value));}}/></label>
+     <label>Min. ROI (%)<input required type="number" min="0" max="1000" step="0.01" value={roi} onChange={event=>{strategyDirty.current=true;setRoi(Number(event.target.value));}}/></label>
+     <label>Min. profit (gold)<input required type="number" min="0" step="0.0001" value={minProfit} onChange={event=>{strategyDirty.current=true;setMinProfit(Number(event.target.value));}}/></label>
+     <label>AH fee (%)<input required type="number" min="0" max="99.99" step="0.01" value={fee} onChange={event=>{strategyDirty.current=true;setFee(Number(event.target.value));}}/></label>
+     <label>Min. observations<input required type="number" min="1" max="24" step="1" value={minHistory} onChange={event=>{strategyDirty.current=true;setMinHistory(Number(event.target.value));}}/></label>
+     <button type="submit" disabled={!status}>Save strategy</button>
+    </form>
+    <p className="muted">Saved strategy applies to this market's scanner, alerts, backtests, and addon plans. Exposure is a per-opportunity limit, not a reservation.</p>
     <section className="filters">
-     <label>Bankroll (gold)<input type="number" min="1" max="10000" value={bank} onChange={event=>setBank(Math.max(1,Number(event.target.value)))}/></label>
-     <label>Min. ROI (%)<input type="number" min="0" max="1000" value={roi} onChange={event=>setRoi(Math.max(0,Number(event.target.value)))}/></label>
      <label>Search<input placeholder="Item name" value={query} onChange={event=>setQuery(event.target.value)}/></label>
      <label className="check"><input type="checkbox" checked={onlyWatch} onChange={event=>setOnlyWatch(event.target.checked)}/> Watchlist only</label>
+     <label className="check"><input type="checkbox" checked={showUnnamed} onChange={event=>setShowUnnamed(event.target.checked)}/> Include items without names</label>
     </section>
+    <details className="panel">
+     <summary>Record item-use research</summary>
+     <p className="muted">Unresearched items are watch-only. Record why players might use an item and where you checked; this is your assessment, not proof of sales. Excluded items are hidden. Enter an excluded item's ID and choose Unknown to restore it.</p>
+     <form className="filters" onSubmit={event=>{event.preventDefault();void action(()=>api('item-use',{itemId:Number(researchId),kind:researchKind,note:researchNote}),'Item research saved.');}}>
+      <label>Item ID<input required type="number" min="1" step="1" value={researchId} onChange={event=>{const next=event.target.value;const evidence=status?.itemUses?.[Number(next)];setResearchId(next);setResearchKind(evidence?.kind||'unknown');setResearchNote(evidence?.note||'');}}/></label>
+      <label>Use or decision<select value={researchKind} onChange={event=>setResearchKind(event.target.value as ItemUseKind|'unknown')}><option value="unknown">Unknown</option><option value="profession">Profession / crafting</option><option value="quest">Quest</option><option value="consumable">Consumable</option><option value="equipment">Equipment</option><option value="other">Other use</option><option value="exclude">Exclude from queue</option></select></label>
+      <label>Use and source<input maxLength={300} required={researchKind!=='unknown'} minLength={researchKind==='unknown'?undefined:3} value={researchNote} onChange={event=>setResearchNote(event.target.value)} placeholder="e.g. recipe or quest name"/></label>
+      <button type="submit">Save research</button>
+     </form>
+    </details>
     <div className="split">
      <section className="panel">
       <h3>Opportunity queue <span>{filtered.length}</span></h3>
-      <div className="scroll"><table><thead><tr><th>Item / confidence</th><th>Buyout</th><th>Net upside</th><th>ROI</th><th>Score</th></tr></thead><tbody>{filtered.map(row=><tr key={row.itemId} onClick={()=>setId(row.itemId)} className={active?.itemId===row.itemId?'chosen':''}><td><button className="link" onClick={()=>setId(row.itemId)}>{name(row.itemId)}</button><small className={row.confidence==='candidate'?'green':'muted'}>{row.confidence}</small></td><td>{money(row.cost)}</td><td className="green">+{money(row.profit)}</td><td>{pct(row.roi)}</td><td>{row.score}</td></tr>)}</tbody></table>{!filtered.length&&<p className="empty">No opportunities match your filters. Try a lower ROI or collect more history.</p>}</div>
+      <div className="scroll"><table><thead><tr><th>Item / confidence</th><th>Buyout</th><th>Potential profit</th><th>ROI</th><th>Score</th></tr></thead><tbody>{filtered.map(row=><tr key={row.itemId} onClick={()=>setId(row.itemId)} className={active?.itemId===row.itemId?'chosen':''}><td><ItemLink id={row.itemId} name={name(row.itemId)}/> <button className="link" onClick={()=>setId(row.itemId)} aria-label={`View details for ${name(row.itemId)}`}>Details</button><small className={row.confidence==='candidate'?'green':'muted'}>{row.confidence} · {status?.itemUses?.[row.itemId]?.kind||'use unknown'}</small></td><td>{money(row.cost)}</td><td className="green">+{money(row.profit)}</td><td>{pct(row.roi)}</td><td>{row.score}</td></tr>)}</tbody></table>{!filtered.length&&<p className="empty">No named opportunities match your filters yet. Names may still be loading; use “Include items without names” to inspect missing names.</p>}</div>
      </section>
      <section className="panel detail">
       {active?<>
-       <div className="between"><h3>{name(active.itemId)}</h3><button onClick={()=>action(()=>api('watch',{itemId:active.itemId}),'Watchlist updated.')}>{status?.watch.includes(active.itemId)?'★ Watching':'☆ Watch'}</button></div>
+       <div className="between"><h3><ItemLink id={active.itemId} name={name(active.itemId)}/></h3><button onClick={()=>action(()=>api('watch',{itemId:active.itemId}),'Watchlist updated.')}>{status?.watch.includes(active.itemId)?'★ Watching':'☆ Watch'}</button></div>
        <div className="three"><div><small>BUY UNITS</small><strong>{active.quantity}</strong></div><div><small>TARGET / UNIT</small><strong>{unit(active.target)}</strong></div><div><small>BREAK-EVEN UNITS</small><strong>{active.breakEvenUnits}</strong></div></div>
+       <p><strong>{active.purchaseListings} listings in buyout</strong> · potential profit {money(active.profit)} ({money(active.profit/Math.max(1,active.purchaseListings))} per listed auction). This is not gold per hour or a prediction of sales.</p>
+       {active.reasons.map(reason=><p className="muted" key={reason}>{reason}</p>)}
        <h4>Order book · lowest tiers</h4>
        <div className="depth">{active.tiers.map(tier=><div className="tier" key={tier.price}><span>{unit(tier.price)}</span><div className="bar"><i className={tier.price<=active.buyMax?'buy':''} style={{width:`${tier.units/Math.max(...active.tiers.map(value=>value.units))*100}%`}}/></div><span>{tier.units}</span></div>)}</div>
        <small>Amber = acquisition tier; green = remaining competition. Max acquisition tier: {unit(active.buyMax)} per unit. Stack buyout total: {money(active.cost)}.</small>
@@ -175,12 +230,12 @@ function App({onLogout}:{onLogout?:()=>void}){
     <h4>Import addon journal</h4>
     <input type="file" accept=".lua,.txt" onChange={event=>{const file=event.target.files?.[0];if(file)void action(async()=>api<{imported:number}>('journal',{text:await file.text()}),result=>`Imported ${result.imported} records.`);}}/>
     <h4>Positions · weighted-average cost</h4>
-    <table><thead><tr><th>Item</th><th>Units</th><th>Basis</th><th>Realized P/L</th><th>Unmatched sales</th></tr></thead><tbody>{portfolio.positions.map(position=><tr key={position.itemId}><td>{name(position.itemId)}</td><td>{position.quantity}</td><td>{money(position.basis)}</td><td>{money(position.realized)}</td><td>{position.unmatched}</td></tr>)}</tbody></table>
+    <table><thead><tr><th>Item</th><th>Units</th><th>Basis</th><th>Realized P/L</th><th>Unmatched sales</th></tr></thead><tbody>{portfolio.positions.map(position=><tr key={position.itemId}><td><ItemLink id={position.itemId} name={name(position.itemId)}/></td><td>{position.quantity}</td><td>{money(position.basis)}</td><td>{money(position.realized)}</td><td>{position.unmatched}</td></tr>)}</tbody></table>
     <h4>Recent trades</h4>
-    <table><thead><tr><th>Time</th><th>Item</th><th>Side</th><th>Qty</th><th>Total / fee</th></tr></thead><tbody>{[...portfolio.trades].reverse().slice(0,50).map(trade=><tr key={trade.id}><td>{new Date(trade.at).toLocaleString()}</td><td>{name(trade.itemId)}</td><td>{trade.side}</td><td>{trade.quantity}</td><td>{money(trade.total)} / {money(trade.fee)}</td></tr>)}</tbody></table>
+    <table><thead><tr><th>Time</th><th>Item</th><th>Side</th><th>Qty</th><th>Total / fee</th></tr></thead><tbody>{[...portfolio.trades].reverse().slice(0,50).map(trade=><tr key={trade.id}><td>{new Date(trade.at).toLocaleString()}</td><td><ItemLink id={trade.itemId} name={name(trade.itemId)}/></td><td>{trade.side}</td><td>{trade.quantity}</td><td>{money(trade.total)} / {money(trade.fee)}</td></tr>)}</tbody></table>
    </section>}
-   {tab==='Backtest'&&<section className="panel"><h3>Historical forward check</h3><p>Evaluates candidates using only data available at the decision time, then checks competing supply in the next snapshot. No simulated sales or claimed profit. Uses server-configured bankroll and ROI.</p><div className="three"><div><small>OBSERVATIONS</small><strong>{backtests.length}</strong></div><div><small>NO LOWER COMPETING SUPPLY</small><strong>{backtests.length?pct(backtests.filter(value=>value.held).length/backtests.length):'—'}</strong></div></div><table><thead><tr><th>Decision time</th><th>Item</th><th>Target</th><th>Next snapshot below target</th><th>Held</th></tr></thead><tbody>{backtests.slice(-100).reverse().map((value,index)=><tr key={index}><td>{new Date(value.at).toLocaleString()}</td><td>{name(value.itemId)}</td><td>{unit(value.target)}</td><td>{value.competingUnits}</td><td>{value.held?'Yes':'No'}</td></tr>)}</tbody></table></section>}
-   {tab==='Alerts'&&<section className="panel"><h3>Candidate alerts</h3><p>Deduplicated live candidates, stored locally. Optional webhook configured in .env. Demo mode never sends alerts.</p><table><thead><tr><th>Time</th><th>Item</th><th>Buyout</th><th>Target</th><th>Potential profit</th></tr></thead><tbody>{alerts.map((alert,index)=><tr key={index}><td>{new Date(alert.at).toLocaleString()}</td><td>{name(alert.itemId)}</td><td>{money(alert.cost)}</td><td>{unit(alert.target)}</td><td>{money(alert.profit)}</td></tr>)}</tbody></table>{!alerts.length&&<p>No live alerts recorded.</p>}</section>}
+   {tab==='Backtest'&&<section className="panel"><h3>Historical forward check</h3><p>Evaluates candidates using only data available at the decision time, then checks competing supply in the next snapshot. No simulated sales or claimed profit. Uses server-configured bankroll and ROI.</p><div className="three"><div><small>OBSERVATIONS</small><strong>{backtests.length}</strong></div><div><small>NO LOWER COMPETING SUPPLY</small><strong>{backtests.length?pct(backtests.filter(value=>value.held).length/backtests.length):'—'}</strong></div></div><table><thead><tr><th>Decision time</th><th>Item</th><th>Target</th><th>Next snapshot below target</th><th>Held</th></tr></thead><tbody>{backtests.slice(-100).reverse().map((value,index)=><tr key={index}><td>{new Date(value.at).toLocaleString()}</td><td><ItemLink id={value.itemId} name={name(value.itemId)}/></td><td>{unit(value.target)}</td><td>{value.competingUnits}</td><td>{value.held?'Yes':'No'}</td></tr>)}</tbody></table></section>}
+   {tab==='Alerts'&&<section className="panel"><h3>Candidate alerts</h3><p>Deduplicated live candidates, stored locally. Optional webhook configured in .env. Demo mode never sends alerts.</p><table><thead><tr><th>Time</th><th>Item</th><th>Buyout</th><th>Target</th><th>Potential profit</th></tr></thead><tbody>{alerts.map((alert,index)=><tr key={index}><td>{new Date(alert.at).toLocaleString()}</td><td><ItemLink id={alert.itemId} name={name(alert.itemId)}/></td><td>{money(alert.cost)}</td><td>{unit(alert.target)}</td><td>{money(alert.profit)}</td></tr>)}</tbody></table>{!alerts.length&&<p>No live alerts recorded.</p>}</section>}
    {tab==='Setup'&&<section className="panel"><h3>Connect your auction house</h3><p>Read README.md for server and local setup. Create a Battle.net API client, enter credentials in .env, discover and compare two in-game items, then pin the verified HOUSE_ID. Restart in live mode. Never share secrets.</p><p>Install addon/AHCorner into the Forever client Interface/AddOns folder. Download Plan.lua below and replace the addon file while logged out, then log in. Use /ahc help. Journal entries are manual and importable after logout or /reload.</p>{provisional?<button disabled title="Verify the auction house before downloading a plan">Download advisory plan</button>:<a href="/api/addon.lua" className="button" download="Plan.lua">Download advisory plan</a>}<p>Market data is delayed. All in-game execution remains manual.</p></section>}
    <footer>AH Corner · local-first · prices in copper internally · not affiliated with Blizzard</footer>
   </main>

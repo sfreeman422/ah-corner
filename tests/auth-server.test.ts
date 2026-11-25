@@ -30,6 +30,8 @@ test('hosted API requires a session, enforces origins and rejects replay',async(
   assert.equal(started,true,`server failed to start: ${stderr}`);
   assert.equal((await fetch(`${origin}/readyz`)).status,200);
   assert.equal((await fetch(`${origin}/api/status`)).status,401);
+  assert.equal((await fetch(`${origin}/api/settings`,{method:'POST',headers:{'Content-Type':'application/json',Origin:origin},body:'{}'})).status,401);
+  assert.equal((await fetch(`${origin}/api/item-use`,{method:'POST',headers:{'Content-Type':'application/json',Origin:origin},body:'{}'})).status,401);
   const code='x'.repeat(43);
   const payload=JSON.stringify({code,verifier:'v'.repeat(43)});
   assert.equal((await fetch(`${origin}/auth/session`,{method:'POST',headers:{'Content-Type':'application/json'},body:payload})).status,403);

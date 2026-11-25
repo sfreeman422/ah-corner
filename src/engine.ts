@@ -1,5 +1,5 @@
 import type {Listing,Snapshot,Stats,Settings,Opportunity,Trade} from './types.ts';
-export const defaults:Settings={bankroll:350000,exposure:.35,minROI:.30,fee:.05,minHistory:6};
+export const defaults:Settings={bankroll:350000,exposure:.35,minROI:.30,minProfit:0,fee:.05,minHistory:6};
 export const validInt=(v:unknown):v is number=>typeof v==='number'&&Number.isSafeInteger(v)&&v>0;
 export function normalize(raw:unknown, kind:Listing['kind']):Listing[]{
  if(!Array.isArray(raw))throw Error('Invalid auction array'); const out:Listing[]=[];const seen=new Set<string>();
@@ -21,15 +21,15 @@ export function scan(current:Snapshot,history:Snapshot[],settings:Settings=defau
  for(const [itemId,rows] of cur){
   // Commodity and noncommodity books with the same item ID are ambiguous: exclude.
   if(new Set(rows.map(x=>x.kind)).size!==1)continue;
-  const tiersMap=new Map<number,{price:number;units:number;cost:number}>();
-  for(const l of rows){const price=Math.ceil(l.total/l.quantity);const t=tiersMap.get(price)||{price,units:0,cost:0};t.units+=l.quantity;t.cost+=l.total;tiersMap.set(price,t);}
+  const tiersMap=new Map<number,{price:number;units:number;cost:number;listingCount:number}>();
+  for(const l of rows){const price=Math.ceil(l.total/l.quantity);const t=tiersMap.get(price)||{price,units:0,cost:0,listingCount:0};t.units+=l.quantity;t.cost+=l.total;t.listingCount++;tiersMap.set(price,t);}
   const tiers=[...tiersMap.values()].sort((a,b)=>a.price-b.price);if(tiers.length<2)continue;
   const hs=maps.map((m,i)=>stats(m.get(itemId)||[],prior[i].at)).filter((x):x is Stats=>!!x);
   const floors=hs.map(x=>x.floor);const supportPrice=quantile(floors,.75);
-  let best:Opportunity|undefined,cost=0,quantity=0;
-  for(let i=0;i<tiers.length-1;i++){cost+=tiers[i].cost;quantity+=tiers[i].units;if(cost>Math.floor(settings.bankroll*settings.exposure))break;
+  let best:Opportunity|undefined,cost=0,quantity=0,purchaseListings=0;
+  for(let i=0;i<tiers.length-1;i++){cost+=tiers[i].cost;quantity+=tiers[i].units;purchaseListings+=tiers[i].listingCount;if(cost>Math.floor(settings.bankroll*settings.exposure))break;
    const target=tiers[i+1].price-1;if(target<=0||target<tiers[i].price)continue;
-   const net=quantity*Math.floor(target*(1-settings.fee));const profit=net-cost,roi=profit/cost;if(roi<settings.minROI||quantity<2)continue;
+   const net=quantity*Math.floor(target*(1-settings.fee));const profit=net-cost,roi=profit/cost;if(roi<settings.minROI||profit<settings.minProfit||quantity<2)continue;
    const support=floors.length?floors.filter(p=>p>=target).length/floors.length:0;
    let removed=0,replenished=0,intervals=0;
    const timeline=[...maps,cur];const times=[...prior.map(s=>s.at),current.at];
@@ -41,7 +41,7 @@ export function scan(current:Snapshot,history:Snapshot[],settings:Settings=defau
    const fresh=current.source==='demo'||Date.now()-current.at<=2*3600000;
    const confidence=hs.length>=settings.minHistory&&support>=.25&&target<=supportPrice&&d!==null&&d>0&&r!==null&&r<=d&&fresh?'candidate':'watch';
    const score=Math.round(100*(.25*clamp((d??0)/quantity)+.25*clamp(roi/1.5)+.20*(1-cost/(settings.bankroll*settings.exposure))+.15*(intervals?clamp(1-(r??0)/Math.max(1,d??0)):0)+.10*support+.05*(fresh?1:0)));
-   const o:Opportunity={itemId,floor:tiers[0].price,target,buyMax:tiers[i].price,quantity,cost,profit,roi,breakEvenUnits:Math.ceil(cost/Math.max(1,Math.floor(target*(1-settings.fee)))),score,historyCount:hs.length,support,replenish:r,removedUnits:d,confidence,tiers:tiers.slice(0,20),reasons:[confidence==='candidate'?'Historical price support and observed supply turnover':'Insufficient support, turnover, or freshness', 'Removed units are NOT verified sales','Buy entire regular auctions; verify live depth and deposits']};
+   const o:Opportunity={itemId,floor:tiers[0].price,target,buyMax:tiers[i].price,quantity,purchaseListings,cost,profit,roi,breakEvenUnits:Math.ceil(cost/Math.max(1,Math.floor(target*(1-settings.fee)))),score,historyCount:hs.length,support,replenish:r,removedUnits:d,confidence,tiers:tiers.slice(0,20),reasons:[confidence==='candidate'?'Historical price support and observed supply turnover':'Insufficient support, turnover, or freshness', 'Removed units are NOT verified sales','Buy entire regular auctions; verify live depth and deposits']};
    if(!best||(o.confidence==='candidate'&&best.confidence==='watch')||(o.confidence===best.confidence&&o.score>best.score))best=o;
   }if(best)out.push(best);
  }return out.sort((a,b)=>Number(b.confidence==='candidate')-Number(a.confidence==='candidate')||b.score-a.score||b.profit-a.profit);

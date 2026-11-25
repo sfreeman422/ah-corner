@@ -27,7 +27,8 @@ async function withHouse(verified:boolean,run:(origin:string)=>Promise<void>){
  assert.ok(scan(snapshots.at(-1)!,snapshots,defaults).some(value=>value.confidence==='candidate'),'fixture must contain a qualifying candidate');
  for(const snapshot of snapshots)await writeFile(join(marketDir,`snap-${snapshot.at}-${snapshot.key}.json`),JSON.stringify(snapshot));
  const recentAlert={key:'recent',at:Date.now(),itemId:4402,target:20,cost:10,profit:5,score:1};
- await writeFile(join(marketDir,'state.json'),JSON.stringify({names:{},watch:[],trades:[],alerts:[recentAlert]}));
+ const itemUses={'4402':{kind:'profession',note:'Fixture crafting use',source:'player',updatedAt:Date.now()-60_000}};
+ await writeFile(join(marketDir,'state.json'),JSON.stringify({names:{},watch:[],trades:[],alerts:[recentAlert],itemUses}));
  const probe=createServer();
  probe.listen(0,'127.0.0.1');
  await once(probe,'listening');
@@ -80,6 +81,7 @@ test('verified live houses retain candidates, alerts and plans',async()=>{
   assert.equal(status.houseVerified,true);
   const {rows}=await (await fetch(`${origin}/api/opportunities?bankroll=35&roi=30`)).json();
   assert.ok(rows.some((row:{confidence:string})=>row.confidence==='candidate'));
+  assert.ok(rows.filter((row:{itemId:number})=>row.itemId!==4402).every((row:{confidence:string;reasons:string[]})=>row.confidence==='watch'&&row.reasons.some(reason=>/use is unknown/i.test(reason))));
   assert.equal((await (await fetch(`${origin}/api/alerts`)).json()).length,1);
   assert.match(await (await fetch(`${origin}/api/addon.lua`)).text(),/\{id=/);
  });

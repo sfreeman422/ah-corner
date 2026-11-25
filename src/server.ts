@@ -10,6 +10,8 @@ import {parseJournal, validateTrade} from './journal.ts';
 import {openStore} from './store.ts';
 import type {Alert, Opportunity, Settings} from './types.ts';
 import {Sessions} from './auth.ts';
+import {applyItemUse,itemUseFor,validateItemUse} from './item-use.ts';
+import {ItemNameResolver} from './item-names.ts';
 
 type PublicProblem={code:string;message:string;action?:string};
 
@@ -88,23 +90,25 @@ const blizzard=new Blizzard();
 if(!demo&&(!validInt(house)||(!houseVerified&&process.env.ALLOW_UNVERIFIED_HOUSE!=='true')))throw Error('Live mode requires HOUSE_ID and either HOUSE_VERIFIED=true after confirmation or ALLOW_UNVERIFIED_HOUSE=true for provisional data');
 
 const market=demo?'demo-us-pvp-horde':`${blizzard.region}:${blizzard.ruleset}:${house}`;
-const settings:Settings={
+const defaultSettings:Settings={
  bankroll:Math.round(Number(process.env.BANKROLL_GOLD||35)*10_000),
  exposure:Number(process.env.MAX_EXPOSURE||.35),
  minROI:Number(process.env.MIN_ROI||.3),
+ minProfit:Math.round(Number(process.env.MIN_PROFIT_GOLD||0)*10_000),
  fee:Number(process.env.AH_FEE||.05),
  minHistory:Number(process.env.MIN_HISTORY||6)
 };
 
 function validSettings(value:Settings){
- if(!validInt(value.bankroll)||!Number.isFinite(value.exposure)||value.exposure<=0||value.exposure>1||!Number.isFinite(value.minROI)||value.minROI<0||value.minROI>10||!Number.isFinite(value.fee)||value.fee<0||value.fee>=1||!validInt(value.minHistory)||value.minHistory>24)throw Error('Invalid strategy settings');
+ if(!validInt(value.bankroll)||!Number.isFinite(value.exposure)||value.exposure<=0||value.exposure>1||!Number.isFinite(value.minROI)||value.minROI<0||value.minROI>10||!Number.isSafeInteger(value.minProfit)||value.minProfit<0||!Number.isFinite(value.fee)||value.fee<0||value.fee>=1||!validInt(value.minHistory)||value.minHistory>24)throw Error('Invalid strategy settings');
  return value;
 }
 
-validSettings(settings);
+validSettings(defaultSettings);
 const store=await openStore(market);
 await store.prune();
 let state=await store.load();
+let settings=validSettings({...defaultSettings,...state.strategy});
 const liveDataRetentionMs=30*24*60*60*1_000;
 function expireLiveState(){
  if(demo)return false;
@@ -134,16 +138,27 @@ function save(){
  return saveQueue;
 }
 
+const nameResolver=new ItemNameResolver({
+ lookup:id=>blizzard.name(id),
+ isKnown:id=>!!state.names[id]&&state.names[id]!==`Item #${id}`,
+ async onName(id,name){
+  state.namesFetchedAt??=Date.now();
+  state.names[id]=name;
+  await save();
+ }
+});
+
 function latest(){return snapshots.at(-1);}
 
 function marketScan(snapshot:NonNullable<ReturnType<typeof latest>>,configured:Settings){
- const rows=scan(snapshot,snapshots,configured);
+ const rows=applyItemUse(scan(snapshot,snapshots,configured),state.itemUses||{});
  return provisional?rows.map(row=>({...row,confidence:'watch' as const,reasons:['Auction house mapping is unverified; compare in-game prices before acting.',...row.reasons]})):rows;
 }
 
 function refresh(){
  const snapshot=latest();
  cached=snapshot?marketScan(snapshot,settings):[];
+ if(!demo)nameResolver.enqueue([...cached.slice(0,100).map(row=>row.itemId),...state.watch]);
 }
 
 function expireInMemorySnapshots(){
@@ -200,17 +215,6 @@ async function collect(){
    state.modified=result.modified||state.modified;
   }
   refresh();
-  if(!demo){
-   const ids=[...new Set([...cached.slice(0,30).map(value=>value.itemId),...state.watch])].filter(id=>!state.names[id]).slice(0,30);
-   for(const id of ids){
-    try{
-     const name=await blizzard.name(id);
-     state.namesFetchedAt??=Date.now();
-     state.names[id]=name;
-    }
-    catch{break;}
-   }
-  }
   await save();
   await alerts();
   lastSuccess=Date.now();
@@ -340,8 +344,44 @@ const server=createServer(async(request,response)=>{
   if(path==='/api/status'){
    requireMethod(method,'GET');
    if(expireLiveState())await save();
+   if(!demo)nameResolver.enqueue([...state.watch,...state.trades.map(trade=>trade.itemId),...state.alerts.map(alert=>alert.itemId)]);
    const snapshot=latest();
-   json(response,{mode,market,houseVerified,at:snapshot?.at||null,listingCount:snapshot?.listings.length||0,snapshots:snapshots.length,collector:{busy,lastChecked,lastSuccess,lastError:lastCollectionError||null,nextScheduledAt:collectSchedule==='interval'&&lastChecked?lastChecked+pollMinutes*60_000:null},settings,watch:state.watch,names:state.names,stale:!snapshot||Date.now()-snapshot.at>7_200_000});
+   json(response,{mode,market,houseVerified,at:snapshot?.at||null,listingCount:snapshot?.listings.length||0,snapshots:snapshots.length,collector:{busy,lastChecked,lastSuccess,lastError:lastCollectionError||null,nextScheduledAt:collectSchedule==='interval'&&lastChecked?lastChecked+pollMinutes*60_000:null},settings,watch:state.watch,names:state.names,itemUses:state.itemUses||{},stale:!snapshot||Date.now()-snapshot.at>7_200_000});
+   return;
+  }
+  if(path==='/api/settings'){
+   requireMethod(method,'POST');
+   const input=await body(request);
+   let next:Settings;
+   try{
+    next=validSettings({bankroll:input.bankroll,exposure:input.exposure,minROI:input.minROI,minProfit:input.minProfit,fee:input.fee,minHistory:input.minHistory});
+   }catch{
+    fail(422,'INVALID_STRATEGY','Check the strategy settings before saving.', 'Use a positive bankroll, exposure between 0% and 100%, nonnegative minimum profit and ROI, a fee below 100%, and 1–24 history observations.');
+   }
+   const previous=state.strategy;
+   state.strategy=next;
+   try{await save();}
+   catch(error){if(state.strategy===next)state.strategy=previous;throw error;}
+   settings=next;
+   refresh();
+   json(response,settings);
+   return;
+  }
+  if(path==='/api/item-use'){
+   requireMethod(method,'POST');
+   const input=await body(request);
+   let value:ReturnType<typeof validateItemUse>;
+   try{value=validateItemUse(input);}
+   catch(error){fail(422,'INVALID_ITEM_USE','Check the item-use details.',errorMessage(error));}
+   const previous=state.itemUses;
+   const updated={...previous};
+   if(value.evidence)updated[String(value.itemId)]=value.evidence;
+   else delete updated[String(value.itemId)];
+   state.itemUses=updated;
+   try{await save();}
+   catch(error){if(state.itemUses===updated)state.itemUses=previous;throw error;}
+   refresh();
+   json(response,{itemId:value.itemId,evidence:value.evidence});
    return;
   }
   if(path==='/api/opportunities'){
@@ -353,6 +393,7 @@ const server=createServer(async(request,response)=>{
    catch{fail(422,'INVALID_FILTERS','The bankroll or ROI filter is invalid.', 'Enter a positive bankroll and an ROI between 0% and 1000%.');}
    const snapshot=latest();
    const rows=snapshot?(configured.bankroll===settings.bankroll&&configured.minROI===settings.minROI?cached:marketScan(snapshot,configured)):[];
+   if(!demo)nameResolver.enqueue(rows.slice(0,100).map(row=>row.itemId));
    json(response,{rows:rows.slice(0,100),mode,at:snapshot?.at});
    return;
   }
@@ -365,13 +406,13 @@ const server=createServer(async(request,response)=>{
   }
   if(path==='/api/backtest'){
    requireMethod(method,'GET');
-   json(response,provisional?[]:backtest(snapshots,settings));
+   json(response,provisional?[]:backtest(snapshots,settings).filter(result=>{const evidence=itemUseFor(state.itemUses||{},result.itemId);return !!evidence&&evidence.kind!=='exclude'&&evidence.updatedAt<=result.at;}));
    return;
   }
   if(path==='/api/alerts'){
    requireMethod(method,'GET');
    if(expireLiveState())await save();
-   json(response,provisional?[]:state.alerts);
+   json(response,provisional?[]:state.alerts.filter(alert=>{const evidence=itemUseFor(state.itemUses||{},alert.itemId);return !!evidence&&evidence.kind!=='exclude'&&evidence.updatedAt<=alert.at;}));
    return;
   }
   if(path==='/api/portfolio'){
@@ -460,6 +501,7 @@ server.listen(port,host,()=>console.log(`AH Corner ${mode}: http://${host}:${por
 
 function shutdown(){
  clearInterval(interval);
+ nameResolver.close();
  server.close(()=>void store.close());
 }
 
