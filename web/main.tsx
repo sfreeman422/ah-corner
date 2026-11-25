@@ -81,6 +81,23 @@ type Status={mode:string;market:string;houseVerified:boolean;at:number|null;list
 type Position={itemId:number;quantity:number;basis:number;realized:number;unmatched:number};
 type Backtest={at:number;itemId:number;target:number;cost:number;potentialProfit:number;competingUnits:number;held:boolean};
 
+// Explain the same evidence used by the scanner without turning a missing
+// check into a reason to trade. The snapshot may have aged since it was scored.
+function blockers(row:Opportunity,status:Status,useKnown:boolean):string[]{
+ const reasons:string[]=[];
+ if(status.mode==='live'&&!status.houseVerified)reasons.push('Verify the auction house in game.');
+ if(status.mode==='live'&&status.stale)reasons.push('Refresh the stale auction snapshot.');
+ if(!useKnown)reasons.push('Research the item’s use and record it before trading.');
+ if(!row.checks.historySufficient)reasons.push(`Wait for more price history (${row.historyCount} of ${row.checks.minimumHistory} observations).`);
+ if(row.checks.supportSufficient!==true)reasons.push('The target does not have enough historical price support.');
+ if(row.checks.targetSupported!==true)reasons.push('The target is above the historical price ceiling or cannot yet be evaluated.');
+ if(row.checks.removalObserved!==true)reasons.push('There is not enough observed listing movement at the target.');
+ if(row.checks.replenishmentControlled!==true)reasons.push('Competing supply is too high or cannot yet be evaluated.');
+ if(!row.checks.fresh&&!status.stale)reasons.push('Refresh the auction snapshot.');
+ if(row.confidence==='watch'&&!reasons.length)reasons.push('Review the market checks before trading.');
+ return reasons;
+}
+
 function App({onLogout}:{onLogout?:()=>void}){
  const [status,setStatus]=useState<Status>();
  const [rows,setRows]=useState<Opportunity[]>([]);
@@ -198,6 +215,8 @@ function App({onLogout}:{onLogout?:()=>void}){
  const insights=active&&status?opportunityInsights(active,status.settings):undefined;
  const activeUse=active?use(active.itemId):undefined;
  const activeConsumable=active?consumableUse(active.itemId):undefined;
+ const activeBlockers=active&&status?blockers(active,status,!!activeUse):[];
+ const canConsider=!!active&&!!status&&active.confidence==='candidate'&&!activeBlockers.length;
 
  return <>
   <header>
@@ -216,12 +235,13 @@ function App({onLogout}:{onLogout?:()=>void}){
    {notice&&<div className="banner" role="status">{notice} <button onClick={()=>setNotice('')}>Dismiss</button></div>}
    <section className="metrics">
     <div><small>STRATEGY BANKROLL</small><strong>{status?money(status.settings.bankroll):'—'}</strong><label>Maximum exposure: {status?money(Math.floor(status.settings.bankroll*status.settings.exposure)):'—'}</label></div>
-    <div><small>OPPORTUNITIES SHOWN</small><strong>{rows.length}</strong><label>{rows.filter(row=>row.confidence==='candidate').length} candidates · up to 100 shown</label></div>
+    <div><small>OPPORTUNITIES SHOWN</small><strong>{rows.length}</strong><label>{rows.filter(row=>status&&row.confidence==='candidate'&&!blockers(row,status,!!use(row.itemId)).length).length} to review · up to 100 shown</label></div>
     <div><small>RECENT BOOKS ANALYZED</small><strong>{status?.snapshots??'—'}</strong><label>{status?.listingCount.toLocaleString()||'—'} priced listings in latest book</label></div>
     <div><small>LAST SNAPSHOT</small><strong className="date">{status?.at?new Date(status.at).toLocaleTimeString([],{hour:'numeric',minute:'2-digit'}):'—'}</strong><label>{status?.at?new Date(status.at).toLocaleDateString():''}</label></div>
    </section>
    <nav>{['Scanner','Portfolio','Backtest','Alerts','Setup'].map(value=><button key={value} className={value===tab?'selected':''} onClick={()=>setTab(value)}>{value}</button>)}</nav>
    {tab==='Scanner'&&<>
+    <details className="panel strategy-panel"><summary>Strategy settings <span>· {status?money(status.settings.bankroll):'—'} bankroll · {status?pct(status.settings.exposure):'—'} max per item</span></summary>
     <form className="filters" onSubmit={event=>{event.preventDefault();void action(async()=>{
      await api<Settings>('settings',{bankroll:Math.round(bank*10_000),exposure:exposure/100,minROI:roi/100,minProfit:Math.round(minProfit*10_000),fee:fee/100,minHistory});
      strategyDirty.current=false;
@@ -235,6 +255,7 @@ function App({onLogout}:{onLogout?:()=>void}){
      <button type="submit" disabled={!status}>Save strategy</button>
     </form>
     <p className="muted">Your strategy applies to your scanner, backtests and addon plans for this market. Exposure is a per-opportunity limit, not a reservation. Scheduled alerts use the shared market strategy.</p>
+    </details>
     <section className="filters">
      <label>Search<input placeholder="Item name" value={query} onChange={event=>setQuery(event.target.value)}/></label>
      <label className="check"><input type="checkbox" checked={onlyWatch} onChange={event=>setOnlyWatch(event.target.checked)}/> Watchlist only</label>
@@ -256,20 +277,34 @@ function App({onLogout}:{onLogout?:()=>void}){
     </details>
     <div className="split">
      <section className="panel">
-      <div className="queue-heading"><div><h3>Opportunity queue <span>{filtered.length}</span></h3><p className="metric-explainer">Select a column heading to sort; search and watchlist filters apply to the first 100 results. Profit assumes every purchased unit sells at the target.</p></div></div>
-      <div className="scroll"><table><thead><tr><SortHeader label="Item / confidence" column="name" sort={sort} onSort={changeSort}/><SortHeader label="Buyout" column="cost" sort={sort} onSort={changeSort}/><SortHeader label="Potential profit" column="profit" sort={sort} onSort={changeSort}/><SortHeader label="ROI" column="roi" sort={sort} onSort={changeSort}/><SortHeader label="Score" column="score" sort={sort} onSort={changeSort}/></tr></thead><tbody>{filtered.map(row=><tr key={row.itemId} onClick={()=>selectOpportunity(row.itemId)} className={active?.itemId===row.itemId?'chosen':''}><td><ItemLink id={row.itemId} name={name(row.itemId)} source={status?.nameSources?.[row.itemId]}/> <button className="link" onClick={event=>{event.stopPropagation();selectOpportunity(row.itemId);}} aria-label={`View details for ${name(row.itemId)}`}>Details</button><small className={row.confidence==='candidate'?'green':'muted'}>{row.confidence} · {useLabel(row.itemId)}</small></td><td>{money(row.cost)}</td><td className="green">+{money(row.profit)}</td><td>{pct(row.roi)}</td><td>{row.score}</td></tr>)}</tbody></table>{!filtered.length&&<p className="empty">No named opportunities match your filters yet. Names may still be loading; use “Include items without names” to inspect missing names.</p>}</div>
+      <div className="queue-heading"><div><h3>Opportunity queue <span>{filtered.length}</span></h3><p className="metric-explainer">Choose an item for its steps and evidence. Select a column heading to sort; filters apply to the first 100 results.</p></div></div>
+      <div className="scroll"><table className="opportunity-table"><thead><tr><SortHeader label="Item" column="name" sort={sort} onSort={changeSort}/><th scope="col">Suggested action</th><SortHeader label="Buyout" column="cost" sort={sort} onSort={changeSort}/><SortHeader label="Potential profit" column="profit" sort={sort} onSort={changeSort}/><SortHeader label="ROI" column="roi" sort={sort} onSort={changeSort}/><SortHeader label="Score" column="score" sort={sort} onSort={changeSort}/></tr></thead><tbody>{filtered.map(row=>{
+       const reasons=status?blockers(row,status,!!use(row.itemId)):['Loading market status.'];
+       const candidate=row.confidence==='candidate'&&!reasons.length;
+       return <tr key={row.itemId} onClick={()=>selectOpportunity(row.itemId)} className={active?.itemId===row.itemId?'chosen':''}><td><ItemLink id={row.itemId} name={name(row.itemId)} source={status?.nameSources?.[row.itemId]}/> <button className="link" onClick={event=>{event.stopPropagation();selectOpportunity(row.itemId);}} aria-label={`View details for ${name(row.itemId)}`}>Details</button><small>{useLabel(row.itemId)}</small></td><td className="queue-action"><strong className={candidate?'green':'warning-text'}>{candidate?(status?.mode==='demo'?'Example reset':'Consider reset'):'Hold off'}</strong><small>{candidate?`Buy all listings through ${unit(row.buyMax)}/unit; relist at ${unit(row.target)}/unit`:reasons[0]}</small></td><td>{money(row.cost)}</td><td className="green">+{money(row.profit)}<small>if all sell</small></td><td>{pct(row.roi)}</td><td>{row.score}</td></tr>;
+      })}</tbody></table>{!filtered.length&&<p className="empty">No named opportunities match your filters yet. Names may still be loading; use “Include items without names” to inspect missing names.</p>}</div>
      </section>
      <section className="panel detail" ref={detailRef}>
       {active&&insights&&status?<>
        <div className="between"><h3><ItemLink id={active.itemId} name={name(active.itemId)} source={status?.nameSources?.[active.itemId]}/></h3><button onClick={()=>action(()=>api('watch',{itemId:active.itemId}),'Watchlist updated.')}>{status?.watch.includes(active.itemId)?'★ Watching':'☆ Watch'}</button></div>
-       <div className={`decision-summary ${active.confidence}`}>
-        <small className="detail-kicker">Decision</small>
-        <strong>{active.confidence==='candidate'?'Candidate · verify in game':provisional?'Watch only · auction house unverified':!activeUse?'Watch only · item use unconfirmed':'Watch only · review the checks below'}</strong>
-        <p>{active.confidence==='candidate'?'The current model checks passed. Confirm the listings and player demand before buying.':'This is a hypothetical reset to research, not a recommendation to buy.'}</p>
+       <div className={`decision-summary ${canConsider?'candidate':'watch'}`}>
+        <small className="detail-kicker">Suggested action {status.mode==='demo'?'· example only':''}</small>
+        <strong>{canConsider?`Consider buying and relisting ${name(active.itemId)}`:'Hold off — do not buy yet'}</strong>
+        <p>{canConsider?`Estimated buyout ${money(active.cost)}; try relisting at ${unit(active.target)} per unit. Verify the market in game first.`:'The plan below is hypothetical. Resolve the checks before considering a purchase.'}</p>
+        {!canConsider&&<ul className="blocker-list">{activeBlockers.map(reason=><li key={reason}>{reason}</li>)}</ul>}
        </div>
        <section className="insight-section">
-        <h4>What the plan would require</h4>
-        <p className="metric-explainer">Buy the lowest listed tiers, then try to relist at the target. Regular auctions must be purchased in full stacks.</p>
+        <h4>{canConsider?'How to do it':'Hypothetical plan — do not buy yet'}</h4>
+        <p className="metric-explainer">Based on the {status.at?new Date(status.at).toLocaleString():'latest'} snapshot. Prices and listings can change before you reach the auction house.</p>
+        <ol className="action-steps">
+         <li><strong>Check the live listings.</strong> Search for {name(active.itemId)} and compare the current prices, quantities and total cost with this plan. If they have changed, stop and refresh the source before reconsidering.</li>
+         <li><strong>Buy all the lowest-priced listings at or below {unit(active.buyMax)} per unit.</strong> The snapshot includes {active.purchaseListings.toLocaleString()} such listings totalling {active.quantity.toLocaleString()} units, for {money(active.cost)} total. Regular auction stacks must be bought in full; the estimate assumes all of these listings are purchased.</li>
+         <li><strong>Try to relist at {unit(active.target)} per unit.</strong> This target is one copper below the next price tier in the snapshot. If all units sell at the target, estimated profit is {money(active.profit)} after the configured AH fee.</li>
+        </ol>
+        <p className="plan-note">Sales are not guaranteed. The estimate excludes deposits, reposting costs and price changes.</p>
+       </section>
+       <details className="insight-section supporting-detail">
+        <summary>Show plan breakdown</summary>
         <div className="plan-grid">
          <div className="plan-card"><small>BUYOUT COST</small><strong>{money(active.cost)}</strong><small>{active.quantity.toLocaleString()} units across {active.purchaseListings.toLocaleString()} listings</small></div>
          <div className="plan-card"><small>CAPITAL AT RISK</small><strong>{pct(insights.capitalFraction)} of bankroll</strong><small>{money(insights.exposureLimit)} per-item exposure limit</small></div>
@@ -279,22 +314,25 @@ function App({onLogout}:{onLogout?:()=>void}){
          <div className="plan-card"><small>BREAK EVEN AT TARGET</small><strong>{active.breakEvenUnits.toLocaleString()} of {active.quantity.toLocaleString()} units</strong><small>Assumes the configured AH fee</small></div>
         </div>
         <p className="plan-note">If every unit sells at the target: {money(insights.grossRevenue)} gross, about {money(insights.feeAmount)} in AH fees, and {money(insights.netRevenue)} after fees. Profit excludes deposits, reposts and price changes; sales are not guaranteed.</p>
-       </section>
+       </details>
        <section className="insight-section">
-        <h4>Why this is {active.confidence==='candidate'?'a candidate':'watch only'}</h4>
+        <h4>Why {canConsider?'the app found this':'the app says to hold off'}</h4>
+        <p className="why-summary">{activeUse?`Known use: ${activeUse.kind}, from ${activeUse.source==='player'?'your research':activeUse.source==='blizzard-forever'?'Blizzard item data':'recipe data'} (${activeUse.note}). A known use does not prove demand.`:'The item’s use is not yet known.'} {active.historyCount?`${pct(active.support)} of ${active.historyCount} prior observed price floors were at or above the proposed target.`:'There are no prior price floors to support the proposed target yet.'} {active.removedUnits===null?'No comparable listing intervals are available.':`About ${active.removedUnits.toFixed(1)} units/hour disappeared at or below the target${active.replenish===null?'.':`, while ${active.replenish.toFixed(1)} units/hour appeared below it.`}`} Disappearing listings may have sold, expired or been cancelled.</p>
+        <details className="supporting-detail"><summary>Show all market checks</summary>
         <ul className="check-list">
          <li className={`check-row ${provisional?'warning':'pass'}`}><span className="check-icon" aria-hidden="true">{provisional?'!':'✓'}</span><div className="check-copy"><strong>Auction house · {provisional?'unverified':status.mode==='demo'?'demo':'verified'}</strong><small>{provisional?'Compare prices with your in-game US PvP Horde auction house before relying on this market.':status.mode==='demo'?'Synthetic data for testing only.':'The selected auction house has been marked verified.'}</small></div></li>
          <li className={`check-row ${activeUse?'pass':'unknown'}`}><span className="check-icon" aria-hidden="true">{activeUse?'✓':'?'}</span><div className="check-copy"><strong>Item use · {activeUse?activeUse.kind:'unknown'}</strong><small>{activeUse?`${activeUse.source==='player'?'Player research':activeUse.source==='blizzard-forever'?'Blizzard Forever item data':'Recipe evidence'}: ${activeUse.note}. A use does not prove demand or sales.`:'No use is known yet; the item category may still be loading. Research it before trading.'}</small>{activeUse?.source==='warcraftforever-recipe'&&activeConsumable&&<small>Blizzard Forever item data also identifies this as {activeConsumable.note.toLowerCase()}.</small>}{activeUse?.source==='warcraftforever-recipe'&&<a href={`https://warcraftforever.com/spells/${activeUse.recipeId}`} target="_blank" rel="noopener noreferrer">View source recipe</a>}</div></li>
          {insights.checks.map(check=><li className={`check-row ${check.status==='caution'?'warning':check.status}`} key={check.key}><span className="check-icon" aria-hidden="true">{check.status==='pass'?'✓':check.status==='caution'?'!':'?'}</span><div className="check-copy"><strong>{check.label} · {check.status==='pass'?'meets model check':check.status==='caution'?'needs attention':'not enough data'}</strong><small>{check.detail}</small></div></li>)}
         </ul>
         <p className="metric-explainer">Score {active.score}/100 is a ranking heuristic, not a probability or an estimate of sales. Removed listings may have sold, expired, or been cancelled.</p>
+        </details>
        </section>
-       <section className="insight-section">
-        <h4>Order book · up to 20 lowest price tiers</h4>
+       <details className="insight-section supporting-detail">
+        <summary>Order book · up to 20 lowest price tiers</summary>
         <div className="depth">{active.tiers.map(tier=><div className="tier" key={tier.price}><span>{unit(tier.price)}</span><div className="bar"><i className={tier.price<=active.buyMax?'buy':''} style={{width:`${tier.units/Math.max(...active.tiers.map(value=>value.units))*100}%`}}/></div><span>{tier.units}</span></div>)}</div>
         <p className="metric-explainer">Amber tiers are included in this buyout; green tiers are remaining listings. Bar length represents units at each price.</p>
-       </section>
-       <section className="insight-section"><h4>Observed floor history · per unit</h4><HistoryChart history={history} loading={historyLoading}/></section>
+       </details>
+       <details className="insight-section supporting-detail"><summary>Observed floor history · per unit</summary><HistoryChart history={history} loading={historyLoading}/></details>
        <div className="detail-actions"><button onClick={()=>{if(!navigator.clipboard){setError({code:'CLIPBOARD_UNAVAILABLE',message:'Clipboard access is unavailable in this browser.',action:'Copy the item name manually.'});return;}void navigator.clipboard.writeText(name(active.itemId)).then(()=>setNotice('Item name copied.')).catch(()=>setError({code:'CLIPBOARD_UNAVAILABLE',message:'Clipboard access was blocked.',action:'Copy the item name manually.'}));}}>Copy item name</button> {provisional?<button disabled title="Verify the auction house before exporting a plan">Export plan</button>:<a className="button" href="/api/addon.lua" download="Plan.lua">Export plan</a>}</div>
       </>:<p>Select an item when opportunities are available.</p>}
      </section>
