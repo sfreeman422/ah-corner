@@ -79,7 +79,8 @@ function HistoryChart({history,loading}:{history:Stats[];loading:boolean}){
 
 type Collector={busy:boolean;lastChecked:number;lastSuccess:number;lastError:PublicProblem|null;nextScheduledAt:number|null};
 type RefreshStatus=Pick<Collector,'busy'|'lastChecked'|'lastSuccess'|'lastError'>&{changed:boolean};
-type Status={mode:string;market:string;houseVerified:boolean;at:number|null;listingCount:number;snapshots:number;collector:Collector;settings:Settings;watch:number[];names:Record<number,string>;nameSources:Record<number,ItemNameDetails['source']>;itemUses:ItemUseMap;recipeUses:RecipeUseMap;blizzardMetadata:BlizzardItemMetadataMap;itemCatalog?:ItemCategoryIndex;catalogLookup?:{busy:boolean;error:string|null;classified:number;knownUses?:number;total:number};metadataError:string|null;recipeIndex:{dataset:string;build:string;fetchedAt:number}|null;recipeLookup:{busy:boolean;error:string|null};stale:boolean};
+type Status={mode:string;market:string;houseVerified:boolean;at:number|null;listingCount:number;snapshots:number;collector:Collector;settings:Settings;monopolyTarget:number|null;watch:number[];names:Record<number,string>;nameSources:Record<number,ItemNameDetails['source']>;itemUses:ItemUseMap;recipeUses:RecipeUseMap;blizzardMetadata:BlizzardItemMetadataMap;itemCatalog?:ItemCategoryIndex;catalogLookup?:{busy:boolean;error:string|null;classified:number;knownUses?:number;total:number};metadataError:string|null;recipeIndex:{dataset:string;build:string;fetchedAt:number}|null;recipeLookup:{busy:boolean;error:string|null};stale:boolean};
+type MonopolyTracking={itemId:number;at:number|null;floor:number|null;units:number;listings:number;history:Stats[]};
 type Position={itemId:number;quantity:number;basis:number;realized:number;unmatched:number};
 type Backtest={at:number;itemId:number;target:number;cost:number;potentialProfit:number;competingUnits:number;held:boolean};
 type StrategyKind='monopolization'|'flipping';
@@ -140,6 +141,10 @@ function App({onLogout}:{onLogout?:()=>void}){
  const [onlyWatch,setOnlyWatch]=useState(false);
  const [showUnnamed,setShowUnnamed]=useState(false);
  const [query,setQuery]=useState('');
+ const [targetQuery,setTargetQuery]=useState('');
+ const [tracking,setTracking]=useState<MonopolyTracking>();
+ const [trackingError,setTrackingError]=useState<PublicProblem>();
+ const [targetPending,setTargetPending]=useState(false);
  const [settledQuery,setSettledQuery]=useState({value:'',revision:0});
  const queryMounted=useRef(false);
  const queryRef=useRef('');
@@ -158,6 +163,49 @@ function App({onLogout}:{onLogout?:()=>void}){
  const [researchKind,setResearchKind]=useState<ItemUseKind|'unknown'>('unknown');
  const [researchNote,setResearchNote]=useState('');
  const [form,setForm]=useState({side:'buy',itemId:'',quantity:'',total:'',fee:'0'});
+ const targetId=status?.monopolyTarget;
+ const targetText=targetQuery.trim();
+ const exactTargetId=/^[1-9][0-9]*$/.test(targetText)&&Number.isSafeInteger(Number(targetText))?Number(targetText):null;
+ const targetMatches=targetText&&!exactTargetId?Object.entries(status?.names||{})
+  .filter(([,itemName])=>itemName.toLowerCase().includes(targetText.toLowerCase())).slice(0,8):[];
+ const tracked=tracking&&tracking.itemId===targetId?tracking:undefined;
+
+ useEffect(()=>{
+  setTrackingError(undefined);
+  if(!targetId||strategy!=='monopolization'||tab!=='Scanner')return;
+  let active=true;
+  api<MonopolyTracking|null>('monopoly-target').then(result=>{
+   if(active)setTracking(result??undefined);
+  }).catch(cause=>{if(active)setTrackingError(problemFrom(cause));});
+  return()=>{active=false;};
+ },[targetId,status?.at,strategy,tab]);
+
+ async function trackItem(itemId:number|null){
+  setTargetPending(true);
+  setTrackingError(undefined);
+  try{
+   await api<{itemId:number|null}>('monopoly-target',{itemId});
+   setStatus(previous=>previous?{...previous,monopolyTarget:itemId}:previous);
+   setTargetQuery('');
+  }catch(cause){setTrackingError(problemFrom(cause));}
+  finally{setTargetPending(false);}
+ }
+
+ function updateSearch(value:string){
+  if(queryRef.current!==value.trim()){
+   queryRef.current=value.trim();
+   setLoadingRows(true);
+   setRows([]);
+  }
+  setQuery(value);
+ }
+
+ function filterForTarget(itemId:number){
+  onlyWatchRef.current=false;
+  setOnlyWatch(false);
+  updateSearch(String(itemId));
+ }
+
  const resolvedName=(itemId:number)=>{const value=status?.names[itemId];return value&&value!==`Item #${itemId}`?value:undefined;};
  const name=(itemId:number)=>resolvedName(itemId)||`Item #${itemId} (name unavailable)`;
  const use=(itemId:number)=>itemUseFor(status?.itemUses||{},itemId,status?.recipeUses||{},status?.blizzardMetadata||{},status?.itemCatalog);
@@ -312,8 +360,39 @@ function App({onLogout}:{onLogout?:()=>void}){
     <section className="strategy-selector" aria-label="Choose a trading strategy">
      <div className="strategy-heading"><div><p className="eyebrow">YOUR APPROACH</p><h3>Choose a strategy</h3></div><span>More strategies can be added as we learn.</span></div>
      <div className="strategy-options" role="group" aria-label="Trading strategy">{strategyOptions.map(option=><button key={option.id} type="button" className={`strategy-option${strategy===option.id?' selected':''}`} aria-pressed={strategy===option.id} onClick={()=>changeStrategy(option.id)}><span className="strategy-name">{option.title}</span><span>{option.description}</span></button>)}</div>
-     <p className="strategy-context">{strategy==='monopolization'?'Focus on one item with search or your watchlist. Each plan models one initial floor increase, not market control. Monitor new supply and actual results before repeating; stop if competitors overwhelm the market. Increase your bankroll in shared settings and sort by Buyout to explore larger opportunities as capital grows. The app does not automatically rotate your focus.':'Looks for an individual cheap listing against recent floors and the remaining market. A 24-hour resale is a goal, not a promise or verified sale.'}</p>
+     <p className="strategy-context">{strategy==='monopolization'?'Save one item as your monopolization target to monitor its price and supply. Each plan models one initial floor increase, not market control. Monitor new supply and actual results before repeating; stop if competitors overwhelm the market. Increase your bankroll in shared settings and sort by Buyout to explore larger opportunities as capital grows. The app does not automatically rotate your focus.':'Looks for an individual cheap listing against recent floors and the remaining market. A 24-hour resale is a goal, not a promise or verified sale.'}</p>
     </section>
+    {strategy==='monopolization'&&<section className="panel monopoly-tracker" aria-labelledby="monopoly-tracker-title">
+     <h3 id="monopoly-tracker-title">Monopolization target</h3>
+     {targetId?<><div className="between">
+      <strong><ItemLink id={targetId} name={name(targetId)} source={status?.nameSources?.[targetId]}/></strong>
+      <div className="tracker-actions">
+       <button type="button" onClick={()=>filterForTarget(targetId)}>Search scanner by ID</button>
+       <button type="button" disabled={targetPending} onClick={()=>void trackItem(null)}>Stop tracking</button>
+      </div>
+     </div>
+     {tracked?<><div className="three">
+      <div><small>LOWEST PRICE PER UNIT</small><strong>{tracked.floor===null?'—':money(tracked.floor)}</strong></div>
+      <div><small>UNITS LISTED</small><strong>{tracked.at===null?'—':tracked.units.toLocaleString()}</strong></div>
+      <div><small>LISTINGS</small><strong>{tracked.at===null?'—':tracked.listings.toLocaleString()}</strong></div>
+     </div>
+     <p className="metric-explainer">{tracked.at===null?'Waiting for a market snapshot.':`As of ${new Date(tracked.at).toLocaleString()}.${tracked.floor===null?' This item had no priced listings in that snapshot.':''}`}</p>
+     <details className="supporting-detail">
+      <summary>Price and supply history</summary>
+      <HistoryChart history={tracked.history} loading={false}/>
+      {tracked.history.length>0&&<div className="tracker-history">
+       <table><thead><tr><th scope="col">Observed</th><th scope="col">Floor per unit</th><th scope="col">Units listed</th><th scope="col">Listings</th></tr></thead>
+       <tbody>{tracked.history.slice(-12).reverse().map(point=><tr key={point.at}><td>{new Date(point.at).toLocaleString()}</td><td>{money(point.floor)}</td><td>{point.units.toLocaleString()}</td><td>{point.listings.toLocaleString()}</td></tr>)}</tbody></table>
+      </div>}
+     </details></>:!trackingError&&<p className="muted">Loading target data…</p>}</>:<p className="muted">Choose one item to follow across auction snapshots. You can also select a target from any opportunity below.</p>}
+     <form className="filters" onSubmit={event=>{event.preventDefault();if(exactTargetId)void trackItem(exactTargetId);}}>
+      <label>{targetId?'Change target':'Find target'}<input placeholder="Item name or ID" maxLength={120} value={targetQuery} onChange={event=>setTargetQuery(event.target.value)}/></label>
+      {exactTargetId!==null&&<button type="submit" disabled={!status||targetPending||exactTargetId===targetId}>Track {resolvedName(exactTargetId)||`item #${exactTargetId}`}</button>}
+     </form>
+     {targetMatches.length>0&&<ul className="target-matches">{targetMatches.map(([itemId,itemName])=><li key={itemId}><button type="button" disabled={targetPending||Number(itemId)===targetId} onClick={()=>void trackItem(Number(itemId))}>{itemName} <span>#{itemId}</span></button></li>)}</ul>}
+     {targetText&&!exactTargetId&&!targetMatches.length&&<p className="muted">No saved names match. Try an exact item ID.</p>}
+     {trackingError&&<p className="banner bad" role="alert">{trackingError.message} {trackingError.action}</p>}
+    </section>}
     <details className="panel strategy-panel"><summary>Shared strategy settings <span>· {status?money(status.settings.bankroll):'—'} bankroll · {status?pct(status.settings.exposure):'—'} max per item</span></summary>
     <form className="filters" onSubmit={event=>{event.preventDefault();void action(async()=>{
      await api<Settings>('settings',{bankroll:Math.round(bank*10_000),exposure:exposure/100,minROI:roi/100,minProfit:Math.round(minProfit*10_000),fee:fee/100,minHistory});
@@ -330,7 +409,7 @@ function App({onLogout}:{onLogout?:()=>void}){
     <p className="muted">These personal settings apply to both strategies for this market. Exposure is a per-opportunity limit, not a reservation. Backtests and addon plans cover monopolization only; scheduled alerts use the shared market settings.</p>
     </details>
     <section className="filters">
-     <label>Search<input placeholder="Item name or ID" maxLength={120} value={query} onChange={event=>{const next=event.target.value;if(queryRef.current!==next.trim()){queryRef.current=next.trim();setLoadingRows(true);setRows([]);}setQuery(next);}}/></label>
+     <label>Search<input placeholder="Item name or ID" maxLength={120} value={query} onChange={event=>updateSearch(event.target.value)}/></label>
      <label className="check"><input type="checkbox" checked={onlyWatch} onChange={event=>{onlyWatchRef.current=event.target.checked;setOnlyWatch(event.target.checked);setLoadingRows(true);setRows([]);}}/> Watchlist only</label>
      <label className="check"><input type="checkbox" checked={showUnnamed} onChange={event=>{showUnnamedRef.current=event.target.checked;setShowUnnamed(event.target.checked);setLoadingRows(true);setRows([]);}}/> Include items without names</label>
     </section>
@@ -360,7 +439,7 @@ function App({onLogout}:{onLogout?:()=>void}){
      </section>
      <section className="panel detail" ref={detailRef} tabIndex={-1} aria-label="Selected opportunity details">
       {active&&insights&&status?<>
-       <div className="between"><h3><ItemLink id={active.itemId} name={name(active.itemId)} source={status?.nameSources?.[active.itemId]}/></h3><button onClick={()=>action(()=>api('watch',{itemId:active.itemId}),'Watchlist updated.')}>{status?.watch.includes(active.itemId)?'★ Watching':'☆ Watch'}</button></div>
+       <div className="between"><h3><ItemLink id={active.itemId} name={name(active.itemId)} source={status?.nameSources?.[active.itemId]}/></h3><div className="tracker-actions">{strategy==='monopolization'&&<button type="button" disabled={!status||targetPending||targetId===active.itemId} onClick={()=>void trackItem(active.itemId)}>{targetId===active.itemId?'Tracked as target':'Track as target'}</button>}<button onClick={()=>action(()=>api('watch',{itemId:active.itemId}),'Watchlist updated.')}>{status?.watch.includes(active.itemId)?'★ Watching':'☆ Watch'}</button></div></div>
        <div className={`decision-summary ${canConsider?'candidate':'watch'}`}>
         <small className="detail-kicker">Suggested action {status.mode==='demo'?'· example only':''}</small>
         <strong>{canConsider?strategy==='flipping'?`Consider flipping one ${name(active.itemId)} listing`:`Consider a ${name(active.itemId)} buyout`:'Hold off — do not buy yet'}</strong>

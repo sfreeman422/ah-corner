@@ -191,6 +191,18 @@ function saveUserStrategy(key:string,next:Settings){
  return write;
 }
 
+function saveMonopolyTarget(key:string,itemId:number|null){
+ const write=saveQueue.catch(()=>{}).then(async()=>{
+  const updated={...state.monopolyTargets};
+  if(itemId===null)delete updated[key];
+  else updated[key]=itemId;
+  await store.save(structuredClone({...state,monopolyTargets:updated}));
+  state.monopolyTargets=updated;
+ });
+ saveQueue=write;
+ return write;
+}
+
 const nameResolver=new ItemNameResolver({
  lookup:id=>blizzard.nameDetails(id),
  isKnown:id=>!!catalogName(id)||!!state.names[id]&&state.names[id]!==`Item #${id}`,
@@ -581,6 +593,8 @@ const server=createServer(async(request,response)=>{
   // Workspace and Slack user are both necessary: IDs are not global across
   // workspaces. Only the server-side Mocker exchange may supply these values.
   const userKey=identity?createHash('sha256').update(JSON.stringify([identity.teamId,identity.userId])).digest('hex'):null;
+  const targetKey=userKey??'local';
+  const monopolyTarget=state.monopolyTargets?.[targetKey]??null;
   const userSettings=userKey&&state.userStrategies?.[userKey]?validSettings({...defaultSettings,...state.userStrategies[userKey]}):settings;
   if(path.startsWith('/api/')){
    expireInMemorySnapshots();
@@ -588,7 +602,7 @@ const server=createServer(async(request,response)=>{
   }
   if(path==='/api/status'){
    requireMethod(method,'GET');
-   if(!demo){const ids=[...state.watch,...state.trades.map(trade=>trade.itemId),...state.alerts.map(alert=>alert.itemId)];nameResolver.enqueue(ids);metadataResolver.enqueue(ids);}
+   if(!demo){const ids=[...(monopolyTarget===null?[]:[monopolyTarget]),...state.watch,...state.trades.map(trade=>trade.itemId),...state.alerts.map(alert=>alert.itemId)];nameResolver.enqueue(ids);metadataResolver.enqueue(ids);}
    const snapshot=latest();
    const catalogNames:Record<number,string>={};
    for(const id of Object.keys(state.itemCatalog?.items||{})){const name=catalogName(Number(id));if(name)catalogNames[Number(id)]=name;}
@@ -601,7 +615,7 @@ const server=createServer(async(request,response)=>{
     if(use&&use.kind!=='exclude')knownUses++;
     if(itemCategoryFor(id,state.blizzardMetadata||{},state.itemCatalog))classified++;
    }
-   json(response,{mode,market,houseVerified,at:snapshot?.at||null,listingCount:snapshot?.listingCount||0,snapshots:snapshots.length,collector:{busy,lastChecked,lastSuccess,lastError:lastCollectionError||null,nextScheduledAt:collectSchedule==='interval'&&lastChecked?lastChecked+pollMinutes*60_000:null},settings:userSettings,watch:state.watch,names,nameSources,itemUses:state.itemUses||{},recipeUses:state.recipeUses||{},blizzardMetadata:state.blizzardMetadata||{},itemCatalog:state.itemCatalog||null,catalogLookup:{busy:catalogBusy,error:catalogError,classified,knownUses,total:snapshot?.items.size||0},metadataError,recipeIndex:state.recipeIndex||null,recipeLookup:{busy:recipeBusy,error:recipeError},stale:!snapshot||Date.now()-snapshot.at>7_200_000});
+   json(response,{mode,market,houseVerified,at:snapshot?.at||null,listingCount:snapshot?.listingCount||0,snapshots:snapshots.length,collector:{busy,lastChecked,lastSuccess,lastError:lastCollectionError||null,nextScheduledAt:collectSchedule==='interval'&&lastChecked?lastChecked+pollMinutes*60_000:null},settings:userSettings,monopolyTarget,watch:state.watch,names,nameSources,itemUses:state.itemUses||{},recipeUses:state.recipeUses||{},blizzardMetadata:state.blizzardMetadata||{},itemCatalog:state.itemCatalog||null,catalogLookup:{busy:catalogBusy,error:catalogError,classified,knownUses,total:snapshot?.items.size||0},metadataError,recipeIndex:state.recipeIndex||null,recipeLookup:{busy:recipeBusy,error:recipeError},stale:!snapshot||Date.now()-snapshot.at>7_200_000});
    return;
   }
   if(path==='/api/settings'){
@@ -682,6 +696,34 @@ const server=createServer(async(request,response)=>{
     return {...row,monopoly:{snapshotUnits,plannedShare:snapshotUnits?row.quantity/snapshotUnits:0}};
    });
    json(response,{rows:visible,mode,at:snapshot?.at,strategy:requestedStrategy});
+   return;
+  }
+  if(path==='/api/monopoly-target'){
+   if(method==='GET'){
+    if(monopolyTarget===null){json(response,null);return;}
+    const snapshot=latest();
+    const group=snapshot?.items.get(monopolyTarget);
+    let units=0,floor=Infinity;
+    if(group)for(let index=group.start;index<group.start+group.length;index++){
+     units+=group.quantities[index];
+     floor=Math.min(floor,Math.ceil(group.totals[index]/group.quantities[index]));
+    }
+    json(response,{
+     itemId:monopolyTarget,
+     at:snapshot?.at??null,
+     floor:group?floor:null,
+     units,
+     listings:group?.length??0,
+     history:await store.history(monopolyTarget)
+    });
+    return;
+   }
+   requireMethod(method,'POST');
+   const {itemId}=await body(request);
+   if(itemId!==null&&!validInt(itemId))fail(422,'INVALID_ITEM_ID','Choose a positive item ID to track.');
+   await saveMonopolyTarget(targetKey,itemId);
+   if(itemId!==null&&!demo){nameResolver.enqueue([itemId]);metadataResolver.enqueue([itemId]);}
+   json(response,{itemId});
    return;
   }
   if(path==='/api/history'){

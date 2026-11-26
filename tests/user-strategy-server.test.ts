@@ -7,14 +7,18 @@ import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import test from 'node:test';
 import {demoSnapshots} from '../src/demo.ts';
-import {defaults} from '../src/engine.ts';
+import {defaults,stats} from '../src/engine.ts';
 
 test('authenticated strategies are isolated by Slack user and workspace and survive re-login and restart',async()=>{
  const dir=await mkdtemp(join(tmpdir(),'ah-user-strategy-'));
  const marketDir=join(dir,'us_1_113');
  await mkdir(marketDir,{recursive:true});
  const snapshots=demoSnapshots().map((snapshot,index)=>({...snapshot,market:'us:1:113',source:'blizzard',key:`user-fixture-${index}`}));
- for(const snapshot of snapshots)await writeFile(join(marketDir,`snap-${snapshot.at}-${snapshot.key}.json`),JSON.stringify(snapshot));
+ for(const snapshot of snapshots){
+  await writeFile(join(marketDir,`snap-${snapshot.at}-${snapshot.key}.json`),JSON.stringify(snapshot));
+  const point=stats(snapshot.listings.filter(listing=>listing.itemId===4402),snapshot.at);
+  await writeFile(join(marketDir,`history-${Math.floor(snapshot.at/3_600_000)}.json`),JSON.stringify({at:snapshot.at,key:snapshot.key,source:snapshot.source,items:{4402:point}}));
+ }
  const legacy={...defaults,bankroll:350_000};
  await writeFile(join(marketDir,'state.json'),JSON.stringify({names:{},watch:[],trades:[],alerts:[],strategy:legacy,itemUses:{4402:{kind:'profession',note:'Fixture recipe use',source:'player',updatedAt:Date.now()-15*3_600_000}}}));
  const probe=createServer();probe.listen(0,'127.0.0.1');await once(probe,'listening');
@@ -61,6 +65,22 @@ test('authenticated strategies are isolated by Slack user and workspace and surv
   ]);
   assert.equal(aliceSave.status,200);assert.deepEqual(await aliceSave.json(),aliceStrategy);
   assert.equal(bobSave.status,200);assert.deepEqual(await bobSave.json(),bobStrategy);
+  const targetPath='/api/monopoly-target';
+  assert.equal((await post('',targetPath,{itemId:4402})).status,401);
+  assert.equal((await post(alice,targetPath,{itemId:-1})).status,422);
+  assert.equal((await post(alice,targetPath,{itemId:4402,userId:'U123ABC2'})).status,200);
+  assert.equal((await post(bob,targetPath,{itemId:999999})).status,200);
+  const getTarget=async(cookie:string)=>(await get(cookie,targetPath)).json();
+  const tracked=await getTarget(alice);
+  assert.equal(tracked.itemId,4402);
+  assert.equal(tracked.floor,700);
+  assert.ok(tracked.units>0&&tracked.history.length>0);
+  const unlisted=await getTarget(bob);
+  assert.equal(unlisted.itemId,999999);
+  assert.equal(unlisted.floor,null);
+  assert.equal(unlisted.units,0);
+  assert.deepEqual(unlisted.history,[]);
+  assert.equal(await getTarget(otherTeam),null);
   assert.deepEqual(await settings(alice),aliceStrategy);
   assert.deepEqual(await settings(bob),bobStrategy);
   assert.deepEqual(await settings(otherTeam),legacy,'same Slack user ID in a different workspace must not share settings');
@@ -81,6 +101,12 @@ test('authenticated strategies are isolated by Slack user and workspace and surv
   await stop();await start();
   assert.equal((await get(alice,'/api/status')).status,401,'a restart must not turn a stale session into another user');
   alice=await signIn('A');bob=await signIn('B');otherTeam=await signIn('C');
+  assert.equal((await getTarget(alice)).itemId,4402);
+  assert.equal((await getTarget(bob)).itemId,999999);
+  assert.equal((await post(bob,targetPath,{itemId:null})).status,200);
+  assert.equal(await getTarget(bob),null);
+  assert.equal((await getTarget(alice)).itemId,4402);
+
   assert.deepEqual(await settings(alice),aliceStrategy);
   assert.deepEqual(await settings(bob),bobStrategy);
   assert.deepEqual(await settings(otherTeam),legacy);
