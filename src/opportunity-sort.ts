@@ -1,6 +1,6 @@
 import type {Opportunity} from './types.ts';
 
-export const opportunitySortKeys=['name','action','cost','profit','roi','score'] as const;
+export const opportunitySortKeys=['name','action','purchasePrice','cost','profit','roi','score'] as const;
 export type OpportunitySortKey=typeof opportunitySortKeys[number];
 export type OpportunitySort={key:OpportunitySortKey;direction:'asc'|'desc'};
 export const defaultOpportunitySort:OpportunitySort={key:'action',direction:'desc'};
@@ -12,7 +12,7 @@ export function nextOpportunitySort(current:OpportunitySort,key:OpportunitySortK
  return {key,direction:key==='name'?'asc':'desc'};
 }
 
-type SortableOpportunity=Pick<Opportunity,'itemId'|'cost'|'profit'|'roi'|'score'|'confidence'>;
+type SortableOpportunity=Pick<Opportunity,'itemId'|'cost'|'quantity'|'profit'|'roi'|'score'|'confidence'>;
 const collator=new Intl.Collator(undefined,{numeric:true,sensitivity:'base'});
 
 export function sortOpportunities<T extends SortableOpportunity>(rows:readonly T[],sort:OpportunitySort,nameForId:(itemId:number)=>string):T[]{
@@ -24,7 +24,9 @@ export function sortOpportunities<T extends SortableOpportunity>(rows:readonly T
   }
   const comparison=sort.key==='name'
    ?collator.compare(nameForId(a.itemId),nameForId(b.itemId))
-   :a[sort.key]-b[sort.key];
+   :sort.key==='purchasePrice'
+    ?a.cost/a.quantity-b.cost/b.quantity
+    :a[sort.key]-b[sort.key];
   // IDs provide a stable tie-break independent of API ordering.
   return comparison?direction*comparison:a.itemId-b.itemId;
  });

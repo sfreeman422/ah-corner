@@ -653,7 +653,7 @@ const server=createServer(async(request,response)=>{
    const requestedSort=url.searchParams.get('sort');
    const requestedDirection=url.searchParams.get('direction');
    const sortKeys:readonly string[]=opportunitySortKeys;
-   if((requestedSort!==null&&!sortKeys.includes(requestedSort))||(requestedDirection!==null&&requestedDirection!=='asc'&&requestedDirection!=='desc'))fail(422,'INVALID_SORT','Choose a valid opportunity sort.','Sort by item name, suggested action, cost, potential profit, ROI or score.');
+   if((requestedSort!==null&&!sortKeys.includes(requestedSort))||(requestedDirection!==null&&requestedDirection!=='asc'&&requestedDirection!=='desc'))fail(422,'INVALID_SORT','Choose a valid opportunity sort.','Sort by item name, suggested action, purchase price, total cost, potential profit, ROI or score.');
    const key=(requestedSort??defaultOpportunitySort.key) as OpportunitySortKey;
    const sort:OpportunitySort={key,direction:(requestedDirection??(key==='name'?'asc':'desc')) as OpportunitySort['direction']};
    const bankroll=url.searchParams.has('bankroll')?Math.round(Number(url.searchParams.get('bankroll'))*10_000):userSettings.bankroll;
