@@ -182,7 +182,8 @@ function App({onLogout}:{onLogout?:()=>void}){
  };
  const selectOpportunity=(itemId:number)=>{
   setId(itemId);
-  if(window.matchMedia('(max-width: 900px)').matches)detailRef.current?.scrollIntoView({behavior:'smooth',block:'start'});
+  detailRef.current?.focus({preventScroll:true});
+  detailRef.current?.scrollIntoView({block:'start',behavior:window.matchMedia('(prefers-reduced-motion: reduce)').matches?'instant':'smooth'});
  };
 
  useEffect(()=>{
@@ -348,16 +349,16 @@ function App({onLogout}:{onLogout?:()=>void}){
       <button type="submit">Save research</button>
      </form>
     </details>
-    <div className="split">
-     <section className="panel">
+    <div className="scanner-results">
+     <section className="panel opportunity-panel">
       <div className="queue-heading"><div><h3>{strategy==='monopolization'?'Monopolization':'Flipping'} opportunities <span>{filtered.length}</span></h3><p className="metric-explainer">Choose an item for its steps and evidence. Search and watchlist filters apply before the first 100 results; select a column heading to sort. Name searches use saved names; search an exact item ID even before its name is available.</p></div></div>
-      <div className="scroll"><table className="opportunity-table"><thead><tr><SortHeader label="Item" column="name" sort={sort} onSort={changeSort}/><SortHeader label="Suggested action" column="action" sort={sort} onSort={changeSort}/><SortHeader label="Avg. buy price" column="purchasePrice" sort={sort} onSort={changeSort}/><SortHeader label={strategy==='flipping'?'Listing cost':'Buyout'} column="cost" sort={sort} onSort={changeSort}/><SortHeader label="Potential profit" column="profit" sort={sort} onSort={changeSort}/><SortHeader label="ROI" column="roi" sort={sort} onSort={changeSort}/><SortHeader label="Score" column="score" sort={sort} onSort={changeSort}/></tr></thead><tbody>{filtered.map(row=>{
+      <div className="opportunity-scroll" role="region" aria-label="Scrollable opportunities table" tabIndex={0}><table className="opportunity-table"><thead><tr><SortHeader label="Item" column="name" sort={sort} onSort={changeSort}/><SortHeader label="Suggested action" column="action" sort={sort} onSort={changeSort}/><SortHeader label="Avg. buy price" column="purchasePrice" sort={sort} onSort={changeSort}/><SortHeader label={strategy==='flipping'?'Listing cost':'Buyout'} column="cost" sort={sort} onSort={changeSort}/><SortHeader label="Potential profit" column="profit" sort={sort} onSort={changeSort}/><SortHeader label="ROI" column="roi" sort={sort} onSort={changeSort}/><SortHeader label="Score" column="score" sort={sort} onSort={changeSort}/></tr></thead><tbody>{filtered.map(row=>{
        const reasons=status?blockers(row,status,!!use(row.itemId)):['Loading market status.'];
        const candidate=row.confidence==='candidate'&&!reasons.length;
        return <tr key={row.itemId} onClick={()=>selectOpportunity(row.itemId)} className={active?.itemId===row.itemId?'chosen':''}><td><ItemLink id={row.itemId} name={name(row.itemId)} source={status?.nameSources?.[row.itemId]}/> <button className="link" onClick={event=>{event.stopPropagation();selectOpportunity(row.itemId);}} aria-label={`View details for ${name(row.itemId)}`}>Details</button><small>{useLabel(row.itemId)}</small></td><td className="queue-action"><strong className={candidate?'green':'warning-text'}>{candidate?(status?.mode==='demo'?'Example':strategy==='flipping'?'Consider flip':'Consider reset'):'Hold off'}</strong><small>{candidate?(strategy==='flipping'?`Buy one listing (${row.quantity.toLocaleString()} units); relist at ${unit(row.target)}/unit`:`Buy all listings through ${unit(row.buyMax)}/unit; relist at ${unit(row.target)}/unit`):reasons[0]}</small></td><td>{money(row.cost/row.quantity)}<small>per unit</small></td><td>{money(row.cost)}</td><td className="green">+{money(row.profit)}<small>if all sell</small></td><td>{pct(row.roi)}</td><td>{row.score}</td></tr>;
       })}</tbody></table>{!filtered.length&&<p className="empty">{loadingRows?'Loading opportunities…':rows.length?'No items match these filters. Names may still be loading; include items without names to inspect them.':'No opportunities match this strategy and filter. Try an exact item ID, adjust the shared settings, or check again after more snapshots.'}</p>}</div>
      </section>
-     <section className="panel detail" ref={detailRef}>
+     <section className="panel detail" ref={detailRef} tabIndex={-1} aria-label="Selected opportunity details">
       {active&&insights&&status?<>
        <div className="between"><h3><ItemLink id={active.itemId} name={name(active.itemId)} source={status?.nameSources?.[active.itemId]}/></h3><button onClick={()=>action(()=>api('watch',{itemId:active.itemId}),'Watchlist updated.')}>{status?.watch.includes(active.itemId)?'★ Watching':'☆ Watch'}</button></div>
        <div className={`decision-summary ${canConsider?'candidate':'watch'}`}>
