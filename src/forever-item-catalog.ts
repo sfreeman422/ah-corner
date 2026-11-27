@@ -6,7 +6,7 @@ const object=(value:unknown):value is Record<string,any>=>!!value&&typeof value=
 const positive=(value:unknown):value is number=>typeof value==='number'&&Number.isSafeInteger(value)&&value>0;
 const nonnegative=(value:unknown):value is number=>typeof value==='number'&&Number.isSafeInteger(value)&&value>=0;
 
-export type ForeverCatalogItem={classId:number;subclassId:number;quality?:number;slot?:number;name?:string};
+export type ForeverCatalogItem={classId:number;subclassId:number;quality?:number;slot?:number;itemLevel?:number;name?:string};
 export type ForeverItemCatalog={dataset:string;build:string;items:Record<string,ForeverCatalogItem>;missingIds:number[]};
 export type ForeverCatalogOptions={fetcher?:typeof fetch;signal?:AbortSignal;requestIntervalMs?:number;batchSize?:number};
 
@@ -66,7 +66,7 @@ export async function fetchForeverItems(itemIds:readonly number[],options:Foreve
    if(entry.name!==null&&entry.name!==undefined&&(typeof entry.name!=='string'||entry.name.length>300))throw Error('Invalid Warcraft Forever item name');
    seen.add(entry.id);
    const name=typeof entry.name==='string'?entry.name.trim():'';
-   items[String(entry.id)]={classId:entry.class,subclassId:entry.subclass,...(entry.quality!==undefined?{quality:entry.quality}:{}),...(entry.slot!==undefined?{slot:entry.slot}:{}),...(name?{name}:{})};
+   items[String(entry.id)]={classId:entry.class,subclassId:entry.subclass,...(entry.quality!==undefined?{quality:entry.quality}:{}),...(entry.slot!==undefined?{slot:entry.slot}:{}),...(positive(entry.level)?{itemLevel:entry.level}:{}),...(name?{name}:{})};
   }
   for(const id of result.missingIds){
    if(!positive(id)||!expected.has(id)||seen.has(id))throw Error('Invalid Warcraft Forever missing item ID');

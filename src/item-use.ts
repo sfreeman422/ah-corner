@@ -10,7 +10,7 @@ export type RecipeUseMap=Record<string,RecipeUseEvidence>;
 // when this particular classification first became known.
 export type BlizzardItemMetadata={source:'blizzard-forever';checkedAt:number;updatedAt:number;classId:number|null;subclassId:number|null};
 export type BlizzardItemMetadataMap=Record<string,BlizzardItemMetadata>;
-export type ItemCategoryIndex={items:Record<string,{classId:number;subclassId:number;updatedAt:number;name?:string;quality?:number;slot?:number}>;dataset:string;build:string;fetchedAt:number;checkedAt:number;missingIds?:number[]};
+export type ItemCategoryIndex={items:Record<string,{classId:number;subclassId:number;updatedAt:number;name?:string;quality?:number;slot?:number;itemLevel?:number}>;dataset:string;build:string;fetchedAt:number;checkedAt:number;includesItemLevels?:true;missingIds?:number[]};
 export type ItemCategory={label:string;source:'blizzard-forever'|'warcraftforever-item';updatedAt:number;checkedAt:number;classId:number;subclassId:number;dataset?:string;build?:string};
 export type AutomaticItemUse=Omit<ItemCategory,'label'>&{kind:'consumable'|'equipment'|'profession'|'other';note:string};
 export type BlizzardUseEvidence=AutomaticItemUse;

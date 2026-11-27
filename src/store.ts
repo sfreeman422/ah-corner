@@ -3,10 +3,11 @@ import {join} from 'node:path';
 import type {Pool, PoolConnection, PoolOptions, ResultSetHeader, RowDataPacket} from 'mysql2/promise';
 import {groups,stats} from './engine.ts';
 import type {BlizzardItemMetadataMap,ItemCategoryIndex,ItemUseMap,RecipeUseMap} from './item-use.ts';
+import type {DisenchantData} from './disenchant.ts';
 import type {ItemNameDetails} from './blizzard.ts';
 import type {Alert, Settings, Snapshot, Stats, Trade} from './types.ts';
 
-export type State={names:Record<number,string>;nameSources?:Record<number,ItemNameDetails['source']>;namesFetchedAt?:number;trades:Trade[];alerts:Alert[];watch:number[];modified?:string;strategy?:Settings;userStrategies?:Record<string,Settings>;monopolyTargets?:Record<string,number>;itemUses?:ItemUseMap;recipeUses?:RecipeUseMap;blizzardMetadata?:BlizzardItemMetadataMap;itemCatalog?:ItemCategoryIndex;recipeIndex?:{dataset:string;build:string;fetchedAt:number}};
+export type State={names:Record<number,string>;nameSources?:Record<number,ItemNameDetails['source']>;namesFetchedAt?:number;trades:Trade[];alerts:Alert[];watch:number[];modified?:string;strategy?:Settings;userStrategies?:Record<string,Settings>;monopolyTargets?:Record<string,number>;itemUses?:ItemUseMap;recipeUses?:RecipeUseMap;blizzardMetadata?:BlizzardItemMetadataMap;itemCatalog?:ItemCategoryIndex;disenchantData?:DisenchantData;recipeIndex?:{dataset:string;build:string;fetchedAt:number}};
 export type Store={
  load:()=>Promise<State>;
  save:(s:State)=>Promise<void>;

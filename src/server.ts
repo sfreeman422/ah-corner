@@ -1,3 +1,4 @@
+import {fetchDisenchantData,scanDisenchant} from './disenchant.ts';
 import {createHash,randomUUID} from 'node:crypto';
 import {readFile} from 'node:fs/promises';
 import {createServer} from 'node:http';
@@ -168,6 +169,7 @@ let saveQueue=Promise.resolve();
 let recipeBusy=false;
 let recipeError:string|null=null;
 let catalogBusy=false;
+let disenchantError=false;
 let catalogError:string|null=null;
 let catalogTimer:ReturnType<typeof setTimeout>|undefined;
 let metadataError:string|null=null;
@@ -309,8 +311,12 @@ async function updateItemCatalog(){
  const lastFull=previous?.fetchedAt||0;
  const full=!previous||lastFull>now||now-lastFull>=liveDataRetentionMs;
  const missing=new Set(previous?.missingIds||[]);
- const unseen=ids.filter(id=>!previous?.items?.[String(id)]&&!missing.has(id));
- if(!full&&!unseen.length&&lastCheck<=now&&now-lastCheck<24*3_600_000)return;
+ const unseen=ids.filter(id=>{
+  const item=previous?.items?.[String(id)];
+  if(!item)return !missing.has(id);
+  return !previous?.includesItemLevels&&(item.classId===2||item.classId===4)&&(item.quality===2||item.quality===3)&&!item.itemLevel;
+ });
+ if(!full&&previous?.includesItemLevels&&!unseen.length&&lastCheck<=now&&now-lastCheck<24*3_600_000)return;
  catalogBusy=true;
  try{
   let result=await fetchForeverItems(full?ids:unseen,{signal:recipeAbort.signal});
@@ -326,15 +332,15 @@ async function updateItemCatalog(){
   for(const [id,item] of Object.entries(result.items)){
    const old=previous?.items?.[id];
    const updatedAt=old&&old.classId===item.classId&&old.subclassId===item.subclassId&&old.quality===item.quality&&old.slot===item.slot&&Number.isFinite(old.updatedAt)&&old.updatedAt>0&&old.updatedAt<=recordedAt?old.updatedAt:recordedAt;
-   items[id]={classId:item.classId,subclassId:item.subclassId,updatedAt,...(item.name?{name:item.name}:{}),...(item.quality!==undefined?{quality:item.quality}:{}),...(item.slot!==undefined?{slot:item.slot}:{})};
+   items[id]={classId:item.classId,subclassId:item.subclassId,updatedAt,...(item.name?{name:item.name}:{}),...(item.quality!==undefined?{quality:item.quality}:{}),...(item.slot!==undefined?{slot:item.slot}:{}),...(item.itemLevel!==undefined?{itemLevel:item.itemLevel}:{})};
    misses.delete(Number(id));
   }
-  for(const id of result.missingIds)misses.add(id);
+  for(const id of result.missingIds){misses.add(id);delete items[id];}
   // Current items take priority if long-lived markets accumulate many IDs.
   const keep=new Set(ids.map(String));
   const extra=Object.keys(items).filter(id=>!keep.has(id)).sort((a,b)=>items[b].updatedAt-items[a].updatedAt);
   for(const id of extra.slice(Math.max(0,10_000-keep.size)))delete items[id];
-  const next={dataset:result.dataset,build:result.build,checkedAt:recordedAt,fetchedAt:replace?recordedAt:previous!.fetchedAt,items,missingIds:[...misses].filter(id=>keep.has(String(id))).slice(0,10_000)};
+  const next={dataset:result.dataset,build:result.build,checkedAt:recordedAt,fetchedAt:replace?recordedAt:previous!.fetchedAt,items,includesItemLevels:true as const,missingIds:[...misses].filter(id=>keep.has(String(id))).slice(0,10_000)};
   state.itemCatalog=next;
   try{await save();}catch(error){if(state.itemCatalog===next)state.itemCatalog=previous;throw error;}
   catalogError=null;
@@ -344,6 +350,24 @@ async function updateItemCatalog(){
  }finally{
   catalogBusy=false;
   if(latest()?.key!==snapshot.key)scheduleItemCatalog(2_000);
+ }
+}
+
+async function updateDisenchantData(){
+ if(demo||Date.now()-(state.disenchantData?.fetchedAt??0)<24*3_600_000)return;
+ try{
+  const data=await fetchDisenchantData(recipeAbort.signal);
+  const write=saveQueue.catch(()=>{}).then(async()=>{
+   await store.save(structuredClone({...state,disenchantData:data}));
+   state.disenchantData=data;
+  });
+  saveQueue=write;
+  await write;
+  disenchantError=false;
+ }catch(error){
+  if(recipeAbort.signal.aborted)return;
+  disenchantError=true;
+  console.warn('Disenchant data refresh failed:',errorMessage(error));
  }
 }
 
@@ -485,6 +509,8 @@ const interval=collectSchedule==='interval'?setInterval(()=>void collect(),pollM
 const recipeStart=!demo?setTimeout(()=>void updateRecipes(),3_000):undefined;
 const recipeInterval=!demo?setInterval(()=>void updateRecipes(),3_600_000):undefined;
 if(!demo)scheduleItemCatalog();
+const disenchantStart=!demo?setTimeout(()=>void updateDisenchantData(),10_000):undefined;
+const disenchantInterval=!demo?setInterval(()=>void updateDisenchantData(),3_600_000):undefined;
 const catalogInterval=!demo?setInterval(()=>scheduleItemCatalog(),3_600_000):undefined;
 const port=positiveInteger('PORT',3000);
 const host=process.env.HOST||'127.0.0.1';
@@ -698,6 +724,22 @@ const server=createServer(async(request,response)=>{
    json(response,{rows:visible,mode,at:snapshot?.at,strategy:requestedStrategy});
    return;
   }
+  if(path==='/api/greens-for-dust'){
+   requireMethod(method,'GET');
+   const data=state.disenchantData,catalog=state.itemCatalog,snapshot=latest();
+   const age=data?Date.now()-data.asOf:Infinity;
+   const empty={rows:[],counts:null,build:data?.build??null,asOf:data?.asOf??null,at:snapshot?.at??null};
+   let reason:string|undefined;
+   if(demo)reason='Greens for Dust needs a verified live auction house.';
+   else if(provisional||!snapshot||Date.now()-snapshot.at>2*3_600_000)reason='Waiting for a fresh snapshot from a verified auction house.';
+   else if(!data||age>21*24*3_600_000)reason=disenchantError?'Disenchant evidence is currently unavailable. The app will retry.':'Waiting for current Forever disenchant evidence.';
+   else if(!catalog?.includesItemLevels||catalog.build!==data.build)reason='Waiting for item levels and disenchant evidence from the same Forever build.';
+   if(reason||!data||!catalog||!snapshot){json(response,{...empty,reason});return;}
+   const result=scanDisenchant(snapshot,snapshots,catalog.items,data,userSettings);
+   nameResolver.enqueue(result.rows.flatMap(row=>[row.itemId,...row.materials.map(material=>material.itemId)]));
+   json(response,{...empty,...result,reason:null});
+   return;
+  }
   if(path==='/api/monopoly-target'){
    if(method==='GET'){
     if(monopolyTarget===null){json(response,null);return;}
@@ -835,6 +877,8 @@ function shutdown(){
  clearInterval(interval);
  clearInterval(recipeInterval);
  clearInterval(catalogInterval);
+ clearInterval(disenchantInterval);
+ clearTimeout(disenchantStart);
  clearTimeout(recipeStart);
  if(catalogTimer)clearTimeout(catalogTimer);
  recipeAbort.abort();

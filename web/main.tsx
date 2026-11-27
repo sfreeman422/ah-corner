@@ -1,3 +1,5 @@
+import {GreensForDust} from './greens-for-dust.tsx';
+import type {DustResponse} from './greens-for-dust.tsx';
 import React,{useEffect,useRef,useState} from 'react';
 import {createRoot} from 'react-dom/client';
 import type {Alert,Opportunity,Settings,Stats,Trade} from '../src/types.ts';
@@ -83,11 +85,12 @@ type Status={mode:string;market:string;houseVerified:boolean;at:number|null;list
 type MonopolyTracking={itemId:number;at:number|null;floor:number|null;units:number;listings:number;history:Stats[]};
 type Position={itemId:number;quantity:number;basis:number;realized:number;unmatched:number};
 type Backtest={at:number;itemId:number;target:number;cost:number;potentialProfit:number;competingUnits:number;held:boolean};
-type StrategyKind='monopolization'|'flipping';
+type StrategyKind='monopolization'|'flipping'|'greens-for-dust';
 type StrategyOpportunity=Opportunity;
 const strategyOptions:{id:StrategyKind;title:string;description:string}[]=[
  {id:'monopolization',title:'Monopolization',description:'Focus on one good: buy out low-priced supply and test a higher floor.'},
- {id:'flipping',title:'Flipping',description:'Buy one underpriced listing and try to resell it without buying the market.'}
+ {id:'flipping',title:'Flipping',description:'Buy one underpriced listing and try to resell it without buying the market.'},
+ {id:'greens-for-dust',title:'Greens for Dust',description:'Buy gear selectively and resell the materials it disenchants into.'}
 ];
 
 // Explain the same evidence used by the scanner without turning a missing
@@ -110,6 +113,7 @@ function blockers(row:StrategyOpportunity,status:Status,useKnown:boolean):string
 
 function App({onLogout}:{onLogout?:()=>void}){
  const [status,setStatus]=useState<Status>();
+ const [dust,setDust]=useState<DustResponse>();
  const [rows,setRows]=useState<StrategyOpportunity[]>([]);
  const [loadingRows,setLoadingRows]=useState(true);
  const [strategy,setStrategy]=useState<StrategyKind>('monopolization');
@@ -226,7 +230,7 @@ function App({onLogout}:{onLogout?:()=>void}){
  };
  const changeStrategy=(next:StrategyKind)=>{
   if(next===strategyRef.current)return;
-  strategyRef.current=next;setLoadingRows(true);setRows([]);setId(undefined);setStrategy(next);
+  strategyRef.current=next;setLoadingRows(true);setRows([]);setDust(undefined);setId(undefined);setStrategy(next);
  };
  const selectOpportunity=(itemId:number)=>{
   setId(itemId);
@@ -251,7 +255,7 @@ function App({onLogout}:{onLogout?:()=>void}){
   try{
    const [nextStatus,opportunities,nextAlerts,nextPortfolio]=await Promise.all([
     api<Status>('status'),
-    api<{rows:StrategyOpportunity[]}>(`opportunities?${params}`),
+    requestedStrategy==='greens-for-dust'?api<DustResponse>('greens-for-dust'):api<{rows:StrategyOpportunity[]}>(`opportunities?${params}`),
     api<Alert[]>('alerts'),
     api<typeof portfolio>('portfolio')
    ]);
@@ -265,7 +269,9 @@ function App({onLogout}:{onLogout?:()=>void}){
     setFee(Number((nextStatus.settings.fee*100).toFixed(2)));
     setMinHistory(nextStatus.settings.minHistory);
    }
-   setRows(opportunities.rows);setLoadingRows(false);
+   if('counts' in opportunities)setDust(opportunities);
+   else setRows(opportunities.rows);
+   setLoadingRows(false);
    setAlerts(nextAlerts);
    setPortfolio(nextPortfolio);
    setError(undefined);
@@ -351,7 +357,7 @@ function App({onLogout}:{onLogout?:()=>void}){
    {notice&&<div className="banner" role="status">{notice} <button onClick={()=>setNotice('')}>Dismiss</button></div>}
    <section className="metrics">
     <div><small>STRATEGY BANKROLL</small><strong>{status?money(status.settings.bankroll):'—'}</strong><label>Maximum exposure: {status?money(Math.floor(status.settings.bankroll*status.settings.exposure)):'—'}</label></div>
-    <div><small>OPPORTUNITIES SHOWN</small><strong>{rows.length}</strong><label>{rows.filter(row=>status&&row.confidence==='candidate'&&!blockers(row,status,!!use(row.itemId)).length).length} to review · up to 100 shown</label></div>
+    <div><small>OPPORTUNITIES SHOWN</small><strong>{strategy==='greens-for-dust'?dust?.rows.length??0:rows.length}</strong><label>{strategy==='greens-for-dust'?'meeting price and evidence checks':rows.filter(row=>status&&row.confidence==='candidate'&&!blockers(row,status,!!use(row.itemId)).length).length+' to review · up to 100 shown'}</label></div>
     <div><small>RECENT BOOKS ANALYZED</small><strong>{status?.snapshots??'—'}</strong><label>{status?.listingCount.toLocaleString()||'—'} priced listings in latest book</label></div>
     <div><small>LAST SNAPSHOT</small><strong className="date">{status?.at?new Date(status.at).toLocaleTimeString([],{hour:'numeric',minute:'2-digit'}):'—'}</strong><label>{status?.at?new Date(status.at).toLocaleDateString():''}</label></div>
    </section>
@@ -360,7 +366,7 @@ function App({onLogout}:{onLogout?:()=>void}){
     <section className="strategy-selector" aria-label="Choose a trading strategy">
      <div className="strategy-heading"><div><p className="eyebrow">YOUR APPROACH</p><h3>Choose a strategy</h3></div><span>More strategies can be added as we learn.</span></div>
      <div className="strategy-options" role="group" aria-label="Trading strategy">{strategyOptions.map(option=><button key={option.id} type="button" className={`strategy-option${strategy===option.id?' selected':''}`} aria-pressed={strategy===option.id} onClick={()=>changeStrategy(option.id)}><span className="strategy-name">{option.title}</span><span>{option.description}</span></button>)}</div>
-     <p className="strategy-context">{strategy==='monopolization'?'Save one item as your monopolization target to monitor its price and supply. Each plan models one initial floor increase, not market control. Monitor new supply and actual results before repeating; stop if competitors overwhelm the market. Increase your bankroll in shared settings and sort by Buyout to explore larger opportunities as capital grows. The app does not automatically rotate your focus.':'Looks for an individual cheap listing against recent floors and the remaining market. A 24-hour resale is a goal, not a promise or verified sale.'}</p>
+     <p className="strategy-context">{strategy==='monopolization'?'Save one item as your monopolization target to monitor its price and supply. Each plan models one initial floor increase, not market control. Monitor new supply and actual results before repeating; stop if competitors overwhelm the market. Increase your bankroll in shared settings and sort by Buyout to explore larger opportunities as capital grows. The app does not automatically rotate your focus.':strategy==='greens-for-dust'?'Checks green and blue gear against observed Forever disenchant outcomes and prices for the resulting materials.':'Looks for an individual cheap listing against recent floors and the remaining market. A 24-hour resale is a goal, not a promise or verified sale.'}</p>
     </section>
     {strategy==='monopolization'&&<section className="panel monopoly-tracker" aria-labelledby="monopoly-tracker-title">
      <h3 id="monopoly-tracker-title">Monopolization target</h3>
@@ -406,8 +412,9 @@ function App({onLogout}:{onLogout?:()=>void}){
      <label>Min. observations<input required type="number" min="1" max="24" step="1" value={minHistory} onChange={event=>{strategyDirty.current=true;setMinHistory(Number(event.target.value));}}/></label>
      <button type="submit" disabled={!status}>Save strategy</button>
     </form>
-    <p className="muted">These personal settings apply to both strategies for this market. Exposure is a per-opportunity limit, not a reservation. Backtests and addon plans cover monopolization only; scheduled alerts use the shared market settings.</p>
+    <p className="muted">These personal settings apply to all strategies for this market. Exposure is a per-opportunity limit, not a reservation. Backtests and addon plans cover monopolization only; scheduled alerts use the shared market settings.</p>
     </details>
+    {strategy==='greens-for-dust'?<GreensForDust scan={dust} name={name}/>:<>
     <section className="filters">
      <label>Search<input placeholder="Item name or ID" maxLength={120} value={query} onChange={event=>updateSearch(event.target.value)}/></label>
      <label className="check"><input type="checkbox" checked={onlyWatch} onChange={event=>{onlyWatchRef.current=event.target.checked;setOnlyWatch(event.target.checked);setLoadingRows(true);setRows([]);}}/> Watchlist only</label>
@@ -495,6 +502,7 @@ function App({onLogout}:{onLogout?:()=>void}){
       </>:<p>Select an item when opportunities are available.</p>}
      </section>
     </div>
+    </>}
    </>}
    {tab==='Portfolio'&&<section className="panel">
     <h3>Trading journal</h3>
